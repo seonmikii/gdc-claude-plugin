@@ -1,0 +1,13 @@
+{
+  "name": "gdc-marketplace",
+  "owner": {
+    "name": "seonmikii"
+  },
+  "plugins": [
+    {
+      "name": "gdc-claude-plugin",
+      "source": "./",
+      "description": "GDC(gdc-service) 연동 플러그인 — MCP 도구 + 슬래시 커맨드 + 진행률 자동 동기화 훅."
+    }
+  ]
+}

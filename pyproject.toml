@@ -1,0 +1,20 @@
+[project]
+name = "gdc-mcp"
+version = "0.1.0"
+description = "stdio MCP server bridging Claude Code to gdc-service (browser-handoff auth, dev default)."
+requires-python = ">=3.13"
+dependencies = [
+    "fastmcp>=2.3.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+gdc-mcp = "gdc_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gdc_mcp"]

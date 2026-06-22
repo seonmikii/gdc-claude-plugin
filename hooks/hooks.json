@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --directory ${CLAUDE_PLUGIN_ROOT} gdc-mcp hook-sync"
+          }
+        ]
+      }
+    ]
+  }
+}

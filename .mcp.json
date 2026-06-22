@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gdc-local": {
+      "command": "uv",
+      "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "gdc-mcp"],
+      "env": {
+        "GDC_BASE_URL": "http://se.gemiso.com:11521",
+        "GDC_WEB_URL": "http://se.gemiso.com:11521"
+      }
+    }
+  }
+}
