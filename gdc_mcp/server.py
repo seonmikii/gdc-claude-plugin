@@ -614,6 +614,7 @@ async def task_from_doc(
       **done → '완료'(완료/closed 계열)**, **partial → '진행'(in_progress)**.
       그 외 값은 자동 매핑하지 않고 기본 상태로 둔다. status 인자를 주면 그 값이 우선한다.
     - project: 생략 시 현재 레포에서 gdc_login으로 저장한 프로젝트(레포별 컨텍스트)를 사용.
+    - 담당자(assignee): 항상 로그인 사용자로 자동 등록(create_task와 동일).
     """
     path = Path(doc_path)
     text = path.read_text(encoding="utf-8")
@@ -654,6 +655,7 @@ async def task_from_doc(
             "status": status,
             "priority": priority,
             "task_type": task_type,
+            "assignee": _current_user_id(),  # 기본 담당자 = 로그인 사용자
         }.items()
         if v is not None
     }
