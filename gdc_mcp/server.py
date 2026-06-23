@@ -318,22 +318,44 @@ def _validate_dates(
         )
 
 
-def _validate_members(project_id: int, assignee: int | None, participant_ids: list[int] | None) -> None:
-    """담당자/관련자가 해당 프로젝트 멤버인지 검증한다(둘 다 없으면 조회 생략)."""
+def _resolve_members(
+    project_id: int, assignee: int | str | None, participant_ids: list[int | str] | None
+) -> tuple[int | None, list[int] | None]:
+    """담당자/관련자(user id 또는 이름)를 user id로 해석·검증한다.
+
+    둘 다 없으면 조회를 생략하고 원본을 반환한다. 멤버가 아니거나 못 찾으면 ValueError로 안내.
+    """
     if assignee is None and not participant_ids:
-        return
-    members = {m.get("user") for m in client.get(f"/api/projects/{project_id}/").json().get("members", [])}
-    bad = []
-    if assignee is not None and assignee not in members:
-        bad.append(f"담당자(id={assignee})")
-    for pid in participant_ids or []:
-        if pid not in members:
-            bad.append(f"관련자(id={pid})")
-    if bad:
-        raise ValueError(
-            f"다음은 이 프로젝트의 멤버가 아니라 지정할 수 없습니다: {', '.join(bad)}. "
-            "get_project_enums의 members에서 유효한 user id를 확인하세요."
+        return assignee, participant_ids
+
+    members = client.get(f"/api/projects/{project_id}/").json().get("members", [])
+    ids = {m.get("user") for m in members}
+    by_name: dict[str, int] = {}
+    for m in members:
+        for nm in (m.get("full_name"), m.get("username")):
+            if nm:
+                by_name[str(nm).strip().lower()] = m.get("user")
+
+    def resolve(value: int | str, label: str) -> int:
+        # 정수(또는 정수 문자열) → id, 그 외 문자열 → 이름으로 매칭
+        if not isinstance(value, bool) and (isinstance(value, int) or str(value).strip().isdigit()):
+            uid = int(value)
+            if uid in ids:
+                return uid
+        else:
+            uid = by_name.get(str(value).strip().lower())
+            if uid is not None:
+                return uid
+        valid = ", ".join(
+            f"{(m.get('full_name') or m.get('username'))}(id={m.get('user')})" for m in members
         )
+        raise ValueError(
+            f"{label} '{value}'은(는) 이 프로젝트의 멤버가 아닙니다. 가능한 멤버: {valid or '(없음)'}"
+        )
+
+    r_assignee = resolve(assignee, "담당자") if assignee is not None else None
+    r_parts = [resolve(p, "관련자") for p in participant_ids] if participant_ids else participant_ids
+    return r_assignee, r_parts
 
 
 @mcp.tool
@@ -343,11 +365,11 @@ def create_task(
     status: str | None = None,
     priority: str | None = None,
     task_type: str | None = None,
-    assignee: int | None = None,
+    assignee: int | str | None = None,
     description: str | None = None,
     planned_start_date: str | None = None,
     planned_end_date: str | None = None,
-    participant_ids: list[int] | None = None,
+    participant_ids: list[int | str] | None = None,
 ) -> dict:
     """태스크를 생성한다. 필수: project(프로젝트 ID), title.
 
@@ -359,14 +381,14 @@ def create_task(
        각 질문에 반드시 "건너뛰기" 포함(실제 값 최대 3개, 나머지는 "기타"로). 고른 값의 name(관련자는 user id)을 넘긴다.
     4) 담당자(assignee)는 묻지 않는다(생략 시 로그인 사용자로 자동 등록 = 작성자와 동일).
 
-    값 형식: status/priority/task_type은 해당 프로젝트 enum의 'name', 날짜는 'YYYY-MM-DD',
-    participant_ids는 관련자 사용자 ID 리스트.
+    값 형식: status/priority/task_type은 해당 프로젝트 enum의 'name', 날짜는 'YYYY-MM-DD'.
+    assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
 
     제약(미충족 시 호출 전 ValueError로 안내·차단): 예상 시작일 ≤ 예상 종료일,
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
     """
     _validate_dates(planned_start_date, planned_end_date)
-    _validate_members(project, assignee, participant_ids)  # 자동 기본 담당자(본인)는 검증 생략
+    assignee, participant_ids = _resolve_members(project, assignee, participant_ids)  # id 또는 이름
     if assignee is None:
         assignee = _current_user_id()
     payload = {
@@ -405,7 +427,7 @@ def update_task(
     status: str | None = None,
     priority: str | None = None,
     task_type: str | None = None,
-    assignee: int | None = None,
+    assignee: int | str | None = None,
     progress: int | None = None,
     planned_start_date: str | None = None,
     planned_end_date: str | None = None,
@@ -415,13 +437,14 @@ def update_task(
     parent: int | None = None,
     is_pinned: bool | None = None,
     tag_ids: list[int] | None = None,
-    participant_ids: list[int] | None = None,
+    participant_ids: list[int | str] | None = None,
 ) -> dict:
     """태스크를 부분 수정(PATCH)한다. 전달한 필드만 갱신된다.
 
     사용자가 수정 권한을 가진 모든 편집 필드를 노출한다(읽기전용 id/number/creator 제외).
     status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인),
-    날짜는 'YYYY-MM-DD', assignee/customer/parent는 ID, tag_ids/participant_ids는 ID 리스트.
+    날짜는 'YYYY-MM-DD', customer/parent는 ID, tag_ids는 ID 리스트.
+    assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
     완료 상태(category=='done')로 전환하면 백엔드가 progress=100·actual_end_date를 자동 보정할 수 있다.
 
     제약(미충족 시 ValueError로 안내·차단): 예상/실제 시작일 ≤ 종료일, 실제 종료일은 미래 불가,
@@ -430,7 +453,7 @@ def update_task(
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
     if assignee is not None or participant_ids:
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
-        _validate_members(project_id, assignee, participant_ids)
+        assignee, participant_ids = _resolve_members(project_id, assignee, participant_ids)  # id 또는 이름
     payload = {
         k: v
         for k, v in {
