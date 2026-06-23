@@ -22,19 +22,21 @@ class NotAuthenticatedError(RuntimeError):
 
 class GdcClient:
     def __init__(self) -> None:
-        self.base_url = os.environ.get("GDC_BASE_URL", "http://localhost:8000").rstrip("/")
-        self._access: str | None = None
-        self._refresh: str | None = None
+        saved = load_tokens()
+        # base_url 우선순위: GDC_BASE_URL 환경변수 > 저장된 인증 서버 > 기본 localhost.
+        # 훅/CLI 경로는 .mcp.json의 env 블록을 못 받으므로, 환경변수가 없으면 사용자가 실제
+        # 인증한 서버(credentials.json의 base_url)를 따라간다. (env 의존성 제거)
+        base = (
+            os.environ.get("GDC_BASE_URL")
+            or (saved.get("base_url") if saved else None)
+            or "http://localhost:8000"
+        )
+        self.base_url = base.rstrip("/")
+        self._access = saved["access"] if saved else None
+        self._refresh = saved["refresh"] if saved else None
         self._http = httpx.Client(base_url=self.base_url, timeout=30.0)
-        self._load_saved()
 
     # --- 인증 ---------------------------------------------------------------
-    def _load_saved(self) -> None:
-        saved = load_tokens()
-        if saved:
-            self._access = saved["access"]
-            self._refresh = saved["refresh"]
-
     def _persist(self) -> None:
         if self._access and self._refresh:
             save_auth(self._access, self._refresh, self.base_url)
