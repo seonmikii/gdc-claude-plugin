@@ -1,12 +1,13 @@
 """브라우저 핸드오프 인증 (A안, loopback).
 
 로컬 콜백 서버를 127.0.0.1에 띄우고 브라우저로 gdc 웹의 /mcp-auth를 연다.
-사용자가 "연결 허용"을 누르면 웹이 MCP 전용 토큰을 콜백으로 POST한다.
+사용자가 "연결 허용"을 누르면 웹이 MCP 전용 토큰을 콜백으로 **top-level 폼 POST 네비게이션**으로
+전달한다. (공개 origin 페이지 → loopback 으로의 fetch는 브라우저 Private Network Access 정책상
+비보안 컨텍스트에서 차단되므로 fetch가 아닌 폼 네비게이션을 쓴다. 토큰은 URL이 아닌 POST 본문에 담긴다.)
 
 보안:
 - 콜백은 127.0.0.1에만 바인딩. Host 헤더가 127.0.0.1인지 검증(DNS rebinding 방어).
 - 1회용 state로 요청 위조 차단.
-- CORS는 localhost/127.0.0.1 또는 web origin에서 온 것만 허용.
 - 타임아웃(기본 180초) 경과 시 거부.
 """
 
@@ -18,6 +19,18 @@ import threading
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def _parse_body(content_type: str, raw: bytes) -> dict:
+    """콜백 본문을 파싱한다. 폼(application/x-www-form-urlencoded)과 JSON 모두 지원."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct == "application/json":
+        try:
+            return json.loads(raw or b"{}")
+        except ValueError:
+            return {}
+    parsed = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+    return {k: v[0] for k, v in parsed.items()}
 
 
 def _free_port() -> int:
@@ -84,18 +97,6 @@ def open_in_chrome(url: str) -> bool:
     return webbrowser.open_new_tab(url)
 
 
-def _origin_allowed(origin: str, web_url: str) -> bool:
-    if not origin:
-        return False
-    try:
-        host = urllib.parse.urlparse(origin).hostname
-    except ValueError:
-        return False
-    if host in ("127.0.0.1", "localhost"):
-        return True
-    return host == urllib.parse.urlparse(web_url).hostname
-
-
 def browser_handoff(web_url: str, timeout: float = 180.0) -> dict:
     """브라우저 핸드오프로 MCP 전용 토큰을 받아 반환한다.
 
@@ -116,17 +117,17 @@ def browser_handoff(web_url: str, timeout: float = 180.0) -> dict:
         def log_message(self, *args):  # noqa: D401 - 콘솔 로그 억제
             pass
 
-        def _cors(self):
-            origin = self.headers.get("Origin", "")
-            if _origin_allowed(origin, web_origin):
-                self.send_header("Access-Control-Allow-Origin", origin)
-                self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "content-type")
-
-        def do_OPTIONS(self):
-            self.send_response(204)
-            self._cors()
+        def _html(self, code: int, message: str):
+            body = (
+                "<!doctype html><meta charset=utf-8><title>GDC</title>"
+                "<body style='font-family:sans-serif;text-align:center;padding:3rem'>"
+                f"<h2>{message}</h2></body>"
+            ).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):
             # DNS rebinding 방어: Host 헤더가 loopback인지 확인
@@ -137,31 +138,23 @@ def browser_handoff(web_url: str, timeout: float = 180.0) -> dict:
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                data = _parse_body(self.headers.get("Content-Type", ""), self.rfile.read(length))
             except (ValueError, OSError):
-                self.send_response(400)
-                self._cors()
-                self.end_headers()
+                self._html(400, "잘못된 요청입니다.")
                 return
 
-            if payload.get("state") != state or not payload.get("access") or not payload.get("refresh"):
-                self.send_response(400)
-                self._cors()
-                self.end_headers()
-                self.wfile.write(b'{"ok":false}')
+            if data.get("state") != state or not data.get("access") or not data.get("refresh"):
+                self._html(400, "인증 정보가 올바르지 않습니다. 다시 시도해 주세요.")
                 return
 
-            result["access"] = payload["access"]
-            result["refresh"] = payload["refresh"]
-            if payload.get("workspace_id") is not None:
-                result["workspace_id"] = payload["workspace_id"]
-            if payload.get("project_id") is not None:
-                result["project_id"] = payload["project_id"]
-            self.send_response(200)
-            self._cors()
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+            result["access"] = data["access"]
+            result["refresh"] = data["refresh"]
+            ws, pj = data.get("workspace_id"), data.get("project_id")
+            if ws not in (None, ""):
+                result["workspace_id"] = int(ws)
+            if pj not in (None, ""):
+                result["project_id"] = int(pj)
+            self._html(200, "인증이 완료되었습니다. 이 탭을 닫고 Claude Code로 돌아가세요.")
             done.set()
 
     server = HTTPServer(("127.0.0.1", port), Handler)
