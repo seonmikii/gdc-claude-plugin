@@ -291,6 +291,51 @@ async def list_my_tasks(
     }
 
 
+# --- 입력 검증 (백엔드 차단 전 미리 안내) ---------------------------------------
+
+
+def _parse_date(value: str, label: str) -> datetime.date:
+    try:
+        return datetime.date.fromisoformat(value)
+    except (ValueError, TypeError):
+        raise ValueError(f"{label}은(는) YYYY-MM-DD 형식이어야 합니다: {value!r}")
+
+
+def _validate_dates(
+    planned_start: str | None = None,
+    planned_end: str | None = None,
+    actual_start: str | None = None,
+    actual_end: str | None = None,
+) -> None:
+    """날짜 순서·미래 제약 검증(전달된 값끼리만 비교; 미전달 항목은 백엔드가 저장값과 대조)."""
+    if planned_start and planned_end and _parse_date(planned_start, "예상 시작일") > _parse_date(planned_end, "예상 종료일"):
+        raise ValueError(f"예상 시작일({planned_start})은 예상 종료일({planned_end})보다 늦을 수 없습니다.")
+    if actual_start and actual_end and _parse_date(actual_start, "실제 시작일") > _parse_date(actual_end, "실제 종료일"):
+        raise ValueError(f"실제 시작일({actual_start})은 실제 종료일({actual_end})보다 늦을 수 없습니다.")
+    if actual_end and _parse_date(actual_end, "실제 종료일") > datetime.date.today():
+        raise ValueError(
+            f"실제 종료일({actual_end})은 미래 날짜로 지정할 수 없습니다 (오늘: {datetime.date.today().isoformat()})."
+        )
+
+
+def _validate_members(project_id: int, assignee: int | None, participant_ids: list[int] | None) -> None:
+    """담당자/관련자가 해당 프로젝트 멤버인지 검증한다(둘 다 없으면 조회 생략)."""
+    if assignee is None and not participant_ids:
+        return
+    members = {m.get("user") for m in client.get(f"/api/projects/{project_id}/").json().get("members", [])}
+    bad = []
+    if assignee is not None and assignee not in members:
+        bad.append(f"담당자(id={assignee})")
+    for pid in participant_ids or []:
+        if pid not in members:
+            bad.append(f"관련자(id={pid})")
+    if bad:
+        raise ValueError(
+            f"다음은 이 프로젝트의 멤버가 아니라 지정할 수 없습니다: {', '.join(bad)}. "
+            "get_project_enums의 members에서 유효한 user id를 확인하세요."
+        )
+
+
 @mcp.tool
 def create_task(
     project: int,
@@ -316,7 +361,12 @@ def create_task(
 
     값 형식: status/priority/task_type은 해당 프로젝트 enum의 'name', 날짜는 'YYYY-MM-DD',
     participant_ids는 관련자 사용자 ID 리스트.
+
+    제약(미충족 시 호출 전 ValueError로 안내·차단): 예상 시작일 ≤ 예상 종료일,
+    담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
     """
+    _validate_dates(planned_start_date, planned_end_date)
+    _validate_members(project, assignee, participant_ids)  # 자동 기본 담당자(본인)는 검증 생략
     if assignee is None:
         assignee = _current_user_id()
     payload = {
@@ -373,7 +423,14 @@ def update_task(
     status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인),
     날짜는 'YYYY-MM-DD', assignee/customer/parent는 ID, tag_ids/participant_ids는 ID 리스트.
     완료 상태(category=='done')로 전환하면 백엔드가 progress=100·actual_end_date를 자동 보정할 수 있다.
+
+    제약(미충족 시 ValueError로 안내·차단): 예상/실제 시작일 ≤ 종료일, 실제 종료일은 미래 불가,
+    담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
     """
+    _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
+    if assignee is not None or participant_ids:
+        project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
+        _validate_members(project_id, assignee, participant_ids)
     payload = {
         k: v
         for k, v in {
