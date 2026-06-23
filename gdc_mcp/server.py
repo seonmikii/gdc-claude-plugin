@@ -221,6 +221,37 @@ def _not_finished_names(project_id: int) -> list[str]:
     return [s["name"] for s in p.get("task_statuses", []) if s.get("category") != "done"]
 
 
+def _finalize_task_list(results: list[dict], overdue: bool, undated: bool, limit: int) -> dict:
+    """태스크 목록에 overdue/undated 클라이언트 필터를 적용하고 표시용 형태로 정리한다."""
+    if overdue:
+        today = datetime.date.today().isoformat()
+        results = [t for t in results if t.get("planned_end_date") and t["planned_end_date"] < today]
+    if undated:
+        results = [t for t in results if not t.get("planned_end_date")]
+    results = results[:limit]
+    return {
+        "count": len(results),
+        "tasks": [
+            {
+                "id": t["id"],
+                "number": t.get("number"),
+                "title": t.get("title"),
+                "project_name": t.get("project_name"),
+                "project": t.get("project"),
+                "status": t.get("status"),
+                "status_label": _STATUS_LABELS.get(t.get("status"), t.get("status")),
+                "priority": t.get("priority"),
+                "priority_label": _PRIORITY_LABELS.get(t.get("priority"), t.get("priority")),
+                "progress": t.get("progress"),
+                "planned_end_date": t.get("planned_end_date"),
+                "assignee_name": t.get("assignee_name"),
+                "url": _task_url(t["id"]),
+            }
+            for t in results
+        ],
+    }
+
+
 @mcp.tool
 async def list_my_tasks(
     ctx: Context,
@@ -260,35 +291,40 @@ async def list_my_tasks(
                 kept.append(t)
         results = kept
 
-    if overdue:
-        today = datetime.date.today().isoformat()
-        results = [t for t in results if t.get("planned_end_date") and t["planned_end_date"] < today]
+    return _finalize_task_list(results, overdue, undated, limit)
 
-    if undated:
-        results = [t for t in results if not t.get("planned_end_date")]
 
-    results = results[:limit]
+@mcp.tool
+async def list_tasks(
+    ctx: Context,
+    assignee: int | str,
+    not_finished: bool = True,
+    overdue: bool = False,
+    undated: bool = False,
+    limit: int = 20,
+) -> dict:
+    """특정 담당자의 태스크를 현재 레포 프로젝트에서 조회한다.
 
-    return {
-        "count": len(results),
-        "tasks": [
-            {
-                "id": t["id"],
-                "number": t.get("number"),
-                "title": t.get("title"),
-                "project_name": t.get("project_name"),
-                "project": t.get("project"),
-                "status": t.get("status"),
-                "status_label": _STATUS_LABELS.get(t.get("status"), t.get("status")),
-                "priority": t.get("priority"),
-                "priority_label": _PRIORITY_LABELS.get(t.get("priority"), t.get("priority")),
-                "progress": t.get("progress"),
-                "planned_end_date": t.get("planned_end_date"),
-                "url": _task_url(t["id"]),
-            }
-            for t in results
-        ],
+    assignee는 user id **또는 멤버 이름**(full_name/username) — 자동으로 id로 해석한다.
+    조회 프로젝트는 현재 레포에서 gdc_login으로 저장한 프로젝트로 고정한다(미설정 시 오류).
+    필터는 list_my_tasks와 동일: not_finished(미완료만)/overdue(마감 지남)/undated(날짜 미정).
+    "내" 태스크는 list_my_tasks를, 특정 담당자는 이 도구를 쓴다.
+    """
+    project_id = (await _resolve_context(ctx)).get("project_id")
+    if project_id is None:
+        raise ValueError("프로젝트가 설정되지 않았습니다. gdc_login으로 프로젝트를 선택하세요.")
+    assignee_id, _ = _resolve_members(project_id, assignee, None)
+    fetch_size = 200 if (overdue or undated) else limit
+    params: dict[str, str | int] = {
+        "assignee": assignee_id,
+        "project": project_id,
+        "ordering": "planned_end_date",
+        "page_size": fetch_size,
     }
+    if not_finished:
+        params["status"] = ",".join(_not_finished_names(project_id))
+    results = client.get(_TASKS, params=params).json().get("results", [])
+    return _finalize_task_list(results, overdue, undated, limit)
 
 
 # --- 입력 검증 (백엔드 차단 전 미리 안내) ---------------------------------------
@@ -795,6 +831,18 @@ def gdc_my_tasks(flags: str = "") -> str:
         "조회 프로젝트는 현재 레포에 저장된 프로젝트로 고정됩니다.\n"
         "결과는 번호/제목/상태/마감일/URL 표로 보여주되, 상태·우선순위는 응답의 `status_label`·`priority_label`(한글), "
         "프로젝트는 `project_name`(ID 대신)을 씁니다. 특정 태스크를 열어달라고 하면 `open_task(task_id)`로 Chrome 새 탭에 엽니다."
+    )
+
+
+@mcp.prompt
+def gdc_tasks(assignee: str = "", flags: str = "") -> str:
+    """특정 담당자의 태스크 조회. assignee=이름 또는 user id, flags 예: '--overdue' '--undated' '--all'."""
+    return (
+        f"`list_tasks` 도구로 특정 담당자의 태스크를 마감 임박순으로 조회하세요. 담당자: {assignee or '(필수: 이름 또는 user id)'} / 옵션: {flags or '(없음)'}\n"
+        "- assignee 인자에 멤버 이름(예: 김철수) 또는 user id를 그대로 넘기면 도구가 자동으로 id로 해석합니다.\n"
+        "- `--overdue`→overdue=true, `--undated`→undated=true, `--all`→not_finished=false(완료 포함).\n"
+        "조회 프로젝트는 현재 레포에 저장된 프로젝트로 고정됩니다. 비멤버 이름이면 도구가 가능한 멤버 목록을 안내합니다.\n"
+        "결과 표기는 list_my_tasks와 동일(번호/제목/상태/마감일/URL, 한글 label·project_name). 특정 태스크는 `open_task`로 엽니다."
     )
 
 
