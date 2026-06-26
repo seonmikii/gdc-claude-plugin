@@ -1,0 +1,2 @@
+# 작업 이력은 항상 파일 끝에 누적 → conflict 없이 자동 병합
+docs/INDEX.md merge=union
