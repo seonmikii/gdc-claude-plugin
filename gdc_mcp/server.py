@@ -422,27 +422,30 @@ def create_task(
 
     제약(미충족 시 호출 전 ValueError로 안내·차단): 예상 시작일 ≤ 예상 종료일,
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
+
+    완료 보정: status가 완료 계열(category=='done')이면 progress=100·실제 종료일=오늘을 자동 주입한다.
     """
     _validate_dates(planned_start_date, planned_end_date)
     assignee, participant_ids = _resolve_members(project, assignee, participant_ids)  # id 또는 이름
     if assignee is None:
         assignee = _current_user_id()
-    payload = {
-        k: v
-        for k, v in {
-            "project": project,
-            "title": title,
-            "status": status,
-            "priority": priority,
-            "task_type": task_type,
-            "assignee": assignee,
-            "description": description,
-            "planned_start_date": planned_start_date,
-            "planned_end_date": planned_end_date,
-            "participant_ids": participant_ids,
-        }.items()
-        if v is not None
+    fields: dict = {
+        "project": project,
+        "title": title,
+        "status": status,
+        "priority": priority,
+        "task_type": task_type,
+        "assignee": assignee,
+        "description": description,
+        "planned_start_date": planned_start_date,
+        "planned_end_date": planned_end_date,
+        "participant_ids": participant_ids,
     }
+    # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정
+    if status and _status_category(project, status) == "done":
+        fields["progress"] = 100
+        fields["actual_end_date"] = datetime.date.today().isoformat()
+    payload = {k: v for k, v in fields.items() if v is not None}
     t = client.request("POST", _TASKS, json=payload).json()
     return {
         "id": t["id"],
@@ -600,11 +603,12 @@ def link_task_to_doc(doc_path: str, task_id: int) -> dict:
     }
 
 
-def _apply_progress_sync(task_id: int, new_progress: int) -> dict:
+def _apply_progress_sync(task_id: int, new_progress: int, description: str | None = None) -> dict:
     """진행률을 PATCH하면서 상태/실제 날짜 전이를 함께 적용한다.
 
     - 최초 진행(0 → 0 초과): 상태를 '진행'(in_progress, planned→만)으로, 실제 시작일을 오늘로(미설정 시).
     - 100% 달성: 상태를 '완료'(done 계열)로, 실제 종료일을 오늘로(미설정 시).
+    - description 전달 시: 같은 PATCH에 태스크 본문(description)도 함께 반영(명시 sync 전용; 훅은 미전달).
     프로젝트 상태 목록은 한 번만 조회해 재사용한다.
     """
     cur = client.get(f"{_TASKS}{task_id}/").json()
@@ -623,6 +627,8 @@ def _apply_progress_sync(task_id: int, new_progress: int) -> dict:
     cur_cat = cat_of.get(cur.get("status"))
     today = datetime.date.today().isoformat()
     payload: dict = {"progress": new_progress}
+    if description is not None:
+        payload["description"] = description
 
     if old_progress == 0 and new_progress > 0 and not cur.get("actual_start_date"):
         payload["actual_start_date"] = today
@@ -642,12 +648,14 @@ def _apply_progress_sync(task_id: int, new_progress: int) -> dict:
 
 
 @mcp.tool
-def sync_doc_progress(doc_path: str, task_id: int | None = None) -> dict:
+def sync_doc_progress(doc_path: str, task_id: int | None = None, description: str | None = None) -> dict:
     """작업 요청 문서의 Phase 진척을 읽어 연결된 태스크 진행률·상태·실제 날짜를 동기화한다.
 
     progress = 완료 Phase 수 / 전체 Phase 수 × 100 (한 Phase는 하위 체크박스가
     전부 [x]일 때 완료). task_id 생략 시 문서 frontmatter의 task_id를 사용한다.
     최초 진행 시 '진행'+실제 시작일, 100% 시 '완료'+실제 종료일로 자동 전이된다.
+    description 전달 시 진행률 PATCH에 태스크 본문(description)도 함께 반영한다 —
+    문서 본문이 수정됐을 때 호출 에이전트가 '[작업 내용]' 요약을 재생성해 넘기는 용도(자동 훅은 진행률 전용).
     """
     text = Path(doc_path).read_text(encoding="utf-8")
     if task_id is None:
@@ -657,7 +665,7 @@ def sync_doc_progress(doc_path: str, task_id: int | None = None) -> dict:
         task_id = int(fm["task_id"])
 
     result = compute_phase_progress(text)
-    t = _apply_progress_sync(task_id, result["progress"])
+    t = _apply_progress_sync(task_id, result["progress"], description)
     out = {
         "task_id": task_id,
         "mode": result["mode"],
@@ -730,6 +738,8 @@ async def task_from_doc(
     - status: 생략 시 문서 메타데이터 표의 `상태`를 보고 매핑한다 —
       **done → '완료'(완료/closed 계열)**, **partial → '진행'(in_progress)**.
       그 외 값은 자동 매핑하지 않고 기본 상태로 둔다. status 인자를 주면 그 값이 우선한다.
+    - 완료 보정: 최종 status가 완료 계열(category=='done')이면 progress=100·실제 종료일=오늘을 자동 주입한다.
+    - task_type: 호출하는 에이전트가 문서 유형/본문을 근거로 프로젝트 enum에 맞춰 매칭해 전달한다(get_project_enums 참고).
     - project: 생략 시 현재 레포에서 gdc_login으로 저장한 프로젝트(레포별 컨텍스트)를 사용.
     - 담당자(assignee): 항상 로그인 사용자로 자동 등록(create_task와 동일).
     """
@@ -763,19 +773,20 @@ async def task_from_doc(
         elif doc_status in ("partial", "in_progress", "in progress", "진행", "진행중"):
             status = _in_progress_status_name(project)
 
-    payload = {
-        k: v
-        for k, v in {
-            "project": project,
-            "title": title,
-            "description": description,
-            "status": status,
-            "priority": priority,
-            "task_type": task_type,
-            "assignee": _current_user_id(),  # 기본 담당자 = 로그인 사용자
-        }.items()
-        if v is not None
+    fields: dict = {
+        "project": project,
+        "title": title,
+        "description": description,
+        "status": status,
+        "priority": priority,
+        "task_type": task_type,
+        "assignee": _current_user_id(),  # 기본 담당자 = 로그인 사용자
     }
+    # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정
+    if status and _status_category(project, status) == "done":
+        fields["progress"] = 100
+        fields["actual_end_date"] = datetime.date.today().isoformat()
+    payload = {k: v for k, v in fields.items() if v is not None}
     t = client.request("POST", _TASKS, json=payload).json()
     url = _task_url(t["id"])
     new_text = upsert_frontmatter(text, {"task_id": str(t["id"]), "task_url": url})
@@ -865,7 +876,8 @@ def gdc_task_new(request: str = "") -> str:
         "새 태스크는 미완료 상태(등록/진행/검토)를 우선 노출하고 완료 계열은 기타로. "
         "관련자는 members 이름으로 다중 선택 후 user id로 환산해 participant_ids로 넘깁니다.\n"
         "5. 예상 시작일/종료일은 자유 입력(YYYY-MM-DD, 생략 가능) → planned_start_date/planned_end_date.\n"
-        "6. 건너뛴 항목은 생략하고 `create_task`로 생성, task_id·프로젝트명·URL을 보고합니다."
+        "6. 건너뛴 항목은 생략하고 `create_task`로 생성, task_id·프로젝트명·URL을 보고합니다. "
+        "완료 계열 상태(category=='done')를 고른 경우 progress=100·실제 종료일=오늘이 자동 보정되므로 별도 입력은 불필요합니다."
     )
 
 
@@ -875,10 +887,13 @@ def gdc_task_from_doc(path: str = "") -> str:
     return (
         f"지정한 작업 요청 문서로 태스크를 생성합니다. 경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
         "1. description을 템플릿에 맞춰 작성: 첫 줄 = 문서 '요청 내용' 한 줄 요약, 다음 '[작업 내용]' 아래 '작업 결과' 단계를 "
-        "블렛(`-`)으로 간단히 요약(각 단계 한 줄). **체크박스 표시(`[ ]`/`[x]`)는 넣지 말 것** — 진행 상태는 progress 필드 담당.\n"
-        "2. `task_from_doc` 도구 호출. project는 현재 레포 컨텍스트(gdc_login 저장값)에서 자동 결정됩니다. "
-        "메타데이터 표의 `상태`는 자동 매핑: done→'완료', partial→'진행'.\n"
-        "3. 생성 결과(task_id/URL)와 문서 frontmatter 갱신 여부를 보고합니다."
+        "블렛(`-`)으로 간단히 요약(각 단계 한 줄). **체크박스 표시(`[ ]`/`[x]`)는 넣지 말 것** — 진행 상태는 progress 필드 담당. "
+        "**'INDEX.md 이력 추가'·검증·테스트 같은 프로세스 메타 단계는 본문에 넣지 말 것**(실제 산출물 단계만).\n"
+        "2. `get_project_enums(project_id)`로 `task_type` 목록을 조회해, 문서 메타표 `유형`+본문 내용에 가장 맞는 enum name을 "
+        "`task_type` 인자로 넘깁니다(확실하지 않으면 생략).\n"
+        "3. `task_from_doc` 도구 호출. project는 현재 레포 컨텍스트(gdc_login 저장값)에서 자동 결정됩니다. "
+        "메타데이터 표의 `상태`는 자동 매핑: done→'완료', partial→'진행'. 완료 매핑 시 progress=100·실제 종료일=오늘이 자동 주입됩니다.\n"
+        "4. 생성 결과(task_id/URL)와 문서 frontmatter 갱신 여부를 보고합니다."
     )
 
 
@@ -888,11 +903,14 @@ def gdc_doc_from_task(task_id: str = "") -> str:
     return (
         f"태스크 ID {task_id or '(필수)'}를 기반으로 작업 요청 문서를 생성하고 그 태스크와 연동합니다.\n"
         f"1. `get_task({task_id})`로 상세(제목/내용/상태+category/우선순위/유형/날짜/진행률/URL)를 가져옵니다.\n"
-        "2. `docs/requests/TEMPLATE.md` 형식으로 작성: 제목=태스크 제목, 메타표(날짜=오늘, 상태=status_category 매핑 "
-        "done→done·in_progress→partial·그 외→partial, 유형/영역은 합리적으로), 요청 내용=description 정리, 작업 결과=진행 체크리스트.\n"
+        "2. **태스크 description을 그대로 옮기지 말 것.** 다음 순서로 작성합니다: "
+        "①관련 코드 검토(태스크 내용에 해당하는 실제 코드/파일을 읽어 현황 파악) → ②기획 정리(요구사항·배경 명확화) → "
+        "③개발 계획 수립(단계별 작업 항목) → ④문서 반영.\n"
+        "3. `docs/requests/TEMPLATE.md` 형식으로 작성: 제목=태스크 제목, 메타표(날짜=오늘, 상태=status_category 매핑 "
+        "done→done·in_progress→partial·그 외→partial, 유형/영역은 합리적으로), 요청 내용=②기획 정리 결과, 작업 결과=③개발 계획 체크리스트.\n"
         f"   문서 맨 위 frontmatter에 `task_id: {task_id}`, `task_url: <url>`을 기록해 연동합니다.\n"
-        "3. 경로: `docs/requests/YYYY-MM/YYYYMMDD-HHmmss-<짧은설명>.md` (타임스탬프는 date 명령).\n"
-        "4. `docs/INDEX.md` `## 이력`에 한 줄 추가. 5. 생성 경로와 task_id/URL을 보고합니다."
+        "4. 경로: `docs/requests/YYYY-MM/YYYYMMDD-HHmmss-<짧은설명>.md` (타임스탬프는 date 명령).\n"
+        "5. `docs/INDEX.md` `## 이력`에 한 줄 추가. 6. 생성 경로와 task_id/URL을 보고합니다."
     )
 
 
@@ -914,6 +932,8 @@ def gdc_sync(path: str = "") -> str:
     return (
         f"`sync_doc_progress` 도구로 문서의 진행률을 연결된 태스크에 동기화하세요. "
         f"경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
+        "문서 본문(요청 내용/작업 결과 단계)이 수정됐다면, '[작업 내용]' 요약(첫 줄 요청 요약 + 단계별 블렛, 체크박스 없이)을 "
+        "재생성해 `sync_doc_progress`의 `description` 인자로 함께 넘겨 태스크 본문도 갱신하세요(진행률만 맞출 때는 생략).\n"
         "동기화 후 progress(%)와 상태 전이(진행/완료), 실제 시작/종료일을 보고하세요."
     )
 

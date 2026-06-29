@@ -19,3 +19,4 @@ description: 새 태스크 생성 (선택 목록·한글·담당자 자동)
    - **관련자**는 members 이름으로 다중 선택 + "건너뛰기", 고른 이름을 user id로 환산해 `participant_ids`로 넘깁니다.
 5. **예상 시작일/종료일**은 자유 입력(`YYYY-MM-DD`, 생략 가능) → `planned_start_date`/`planned_end_date`.
 6. 건너뛴 항목은 생략하고 `create_task`로 생성, task_id·프로젝트명·URL을 보고합니다.
+   - 완료 계열 상태(category=='done')를 고른 경우 **progress=100·실제 종료일=오늘이 자동 보정**되므로 별도 입력은 불필요합니다.

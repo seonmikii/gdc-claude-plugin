@@ -1,7 +1,7 @@
 {
   "name": "gdc-claude-plugin",
   "description": "GDC(gdc-service) 연동 — 태스크 조회/생성/수정, 작업 요청 문서 연동, 진행률 자동 동기화. 브라우저 핸드오프 인증.",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "author": {
     "name": "seonmikii"
   }
