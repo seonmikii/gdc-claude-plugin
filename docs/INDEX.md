@@ -28,3 +28,4 @@
 <!-- 이 섹션은 항상 파일의 마지막 섹션이어야 합니다 (merge=union append 위치). 새 항목은 맨 아래에 추가하세요. -->
 
 2026-06-26 | feat | server/api,commands | done | 2026-06/20260626-171539-task-doc-flow-rules.md | 태스크·문서 플로우 규칙 5종(메타 단계 제외·본문 sync·코드검토 선행·완료 자동보정·유형 자동매칭)
+2026-06-29 | fix | server/api,commands | done | 2026-06/20260629-181949-task-meta-step-filter.md | task_from_doc [작업 내용] 빌드·검증 메타 단계 코드 필터(_strip_meta_steps) 추가 + 프롬프트 강화

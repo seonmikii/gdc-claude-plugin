@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -716,6 +717,38 @@ def _in_progress_status_name(project_id: int) -> str | None:
     return inprog[0]["name"] if inprog else None
 
 
+# [작업 내용] 블렛에서 걸러낼 프로세스 메타 단계 키워드(빌드·검증·테스트·이력 등).
+# 에이전트가 프롬프트 지침을 어기고 메타 단계를 넣어도 도구 레벨에서 제거한다.
+_META_STEP_RE = re.compile(
+    r"빌드|build|타입\s*체크|type\s*check|\btsc\b|검증|verif|"
+    r"테스트|\btest|lint|린트|커밋|\bcommit|푸시|\bpush|"
+    r"index\.md|이력\s*추가|동작\s*확인|정상\s*동작|npm\s+run",
+    re.IGNORECASE,
+)
+
+
+def _strip_meta_steps(description: str) -> str:
+    """description의 '[작업 내용]' 블렛 중 프로세스 메타 단계를 제거한다.
+
+    '[작업 내용]' 헤더 이후의 `-`/`*` 블렛만 검사하며, 메타 키워드(빌드/검증/테스트/
+    lint/커밋/이력 추가/동작 확인 등)에 걸리는 줄을 드롭한다. 그 외 줄(요약·실제 산출물
+    단계)은 그대로 둔다. 진행 상태는 태스크 progress 필드가 담당하므로 메타는 본문에서 뺀다.
+    """
+    in_work = False
+    out: list[str] = []
+    for line in description.splitlines():
+        if line.strip().startswith("[작업 내용]"):
+            in_work = True
+            out.append(line)
+            continue
+        if in_work and re.match(r"^\s*[-*]\s+", line):
+            content = re.sub(r"^\s*[-*]\s+", "", line)
+            if _META_STEP_RE.search(content):
+                continue  # 메타 단계 블렛 제거
+        out.append(line)
+    return "\n".join(out)
+
+
 @mcp.tool
 async def task_from_doc(
     ctx: Context,
@@ -735,6 +768,8 @@ async def task_from_doc(
         [작업 내용]
         - 작업 결과 단계를 블렛(`-`)으로 간단히 요약 (각 단계 한 줄)
         ※ 체크박스 표시(`[ ]`/`[x]`)는 넣지 않는다. 진행 상태는 태스크 progress 필드가 담당한다.
+        ※ 빌드·타입체크·검증·테스트·lint·커밋·배포/동작 확인·'INDEX.md 이력 추가' 같은
+          프로세스 메타 단계는 넣지 않는다(실제 산출물 단계만). 넣더라도 도구가 자동 제거한다.
     - status: 생략 시 문서 메타데이터 표의 `상태`를 보고 매핑한다 —
       **done → '완료'(완료/closed 계열)**, **partial → '진행'(in_progress)**.
       그 외 값은 자동 매핑하지 않고 기본 상태로 둔다. status 인자를 주면 그 값이 우선한다.
@@ -753,6 +788,8 @@ async def task_from_doc(
             "task_id": int(fm["task_id"]),
             "url": fm.get("task_url") or _task_url(int(fm["task_id"])),
         }
+
+    description = _strip_meta_steps(description)  # 메타 단계 블렛 방어적 제거
 
     title = extract_title(text)
     if not title:
@@ -888,7 +925,8 @@ def gdc_task_from_doc(path: str = "") -> str:
         f"지정한 작업 요청 문서로 태스크를 생성합니다. 경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
         "1. description을 템플릿에 맞춰 작성: 첫 줄 = 문서 '요청 내용' 한 줄 요약, 다음 '[작업 내용]' 아래 '작업 결과' 단계를 "
         "블렛(`-`)으로 간단히 요약(각 단계 한 줄). **체크박스 표시(`[ ]`/`[x]`)는 넣지 말 것** — 진행 상태는 progress 필드 담당. "
-        "**'INDEX.md 이력 추가'·검증·테스트 같은 프로세스 메타 단계는 본문에 넣지 말 것**(실제 산출물 단계만).\n"
+        "**빌드·타입체크·검증·테스트·lint·커밋·배포/동작 확인·'INDEX.md 이력 추가' 같은 프로세스 메타 단계는 본문에 넣지 말 것**"
+        "(실제 산출물 단계만; 원본 문서 '작업 결과'에 그런 단계가 있어도 옮기지 않는다). 넣더라도 도구가 자동 제거한다.\n"
         "2. `get_project_enums(project_id)`로 `task_type` 목록을 조회해, 문서 메타표 `유형`+본문 내용에 가장 맞는 enum name을 "
         "`task_type` 인자로 넘깁니다(확실하지 않으면 생략).\n"
         "3. `task_from_doc` 도구 호출. project는 현재 레포 컨텍스트(gdc_login 저장값)에서 자동 결정됩니다. "
