@@ -5,7 +5,7 @@
 * **MCP 서버(`gdc-local`, stdio)** — gdc-service REST를 감싸 태스크 조회/생성/수정, 작업 요청 문서 연동, 진행률 동기화 도구 제공
 * **슬래시 커맨드** (`commands/`) — Claude Code 전용
 * **PostToolUse 훅** (`hooks/`) — `docs/requests/**/*.md` 편집 시 연결된 태스크 진행률 자동 동기화 (Claude Code 전용)
-* **연결 대상 기본값**: 개발 서버 `http://se.gemiso.com:11521` (`.mcp.json`의 `env`)
+* **연결 대상 기본값**: 운영 서버 `https://gdc.gemiso.com` (`.mcp.json`의 `env`)
 
 # 기술 스택
 
@@ -27,7 +27,7 @@
 * `commands/` — 슬래시 커맨드 정의(`/gdc-*`)
 * `hooks/` — `hooks.json` (PostToolUse 진행률 동기화)
 * `.claude-plugin/` — `plugin.json`(버전), `marketplace.json`
-* `.mcp.json` — MCP 서버 기동 정의(dev 도메인 `env`)
+* `.mcp.json` — MCP 서버 기동 정의(운영 도메인 `env`)
 
 # 프로젝트 규칙
 
@@ -40,7 +40,7 @@
 * **인증은 브라우저 핸드오프 전용**이다. username/password 자동 로그인 변수는 추가하지 않는다.
 * 토큰/시크릿은 저장 파일(`~/.gdc-mcp/credentials.json`)·메모리로만 다루고, **커밋·로그·도구 응답에 노출하지 않는다.**
 * 콜백은 `127.0.0.1` loopback + 1회용 state로 한정한다.
-* dev는 현재 HTTP(평문) — 평문 전송 위험은 인지된 상태이며 별도 후속 대상이다.
+* 기본 연결(운영)은 HTTPS다. dev 서버(`http://se.gemiso.com:11521`)로 override 시 HTTP(평문) — 평문 전송 위험은 인지된 상태이며 별도 후속 대상이다.
 
 ## MCP 서버 규칙
 * **uv로 Python 의존성 관리** (`pyproject.toml` + `uv.lock`). 의존성 추가 시 `uv add`.

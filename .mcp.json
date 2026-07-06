@@ -4,8 +4,8 @@
       "command": "uv",
       "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "gdc-mcp"],
       "env": {
-        "GDC_BASE_URL": "http://se.gemiso.com:11521",
-        "GDC_WEB_URL": "http://se.gemiso.com:11521"
+        "GDC_BASE_URL": "https://gdc.gemiso.com",
+        "GDC_WEB_URL": "https://gdc.gemiso.com"
       }
     }
   }

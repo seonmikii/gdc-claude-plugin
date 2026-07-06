@@ -29,3 +29,4 @@
 
 2026-06-26 | feat | server/api,commands | done | 2026-06/20260626-171539-task-doc-flow-rules.md | 태스크·문서 플로우 규칙 5종(메타 단계 제외·본문 sync·코드검토 선행·완료 자동보정·유형 자동매칭)
 2026-06-29 | fix | server/api,commands | done | 2026-06/20260629-181949-task-meta-step-filter.md | task_from_doc [작업 내용] 빌드·검증 메타 단계 코드 필터(_strip_meta_steps) 추가 + 프롬프트 강화
+2026-07-06 | infra | infra/config | done | 2026-07/20260706-165536-prod-server-switch.md | 기본 연결 대상을 운영 서버(https://gdc.gemiso.com)로 변경 (.mcp.json·README·rules, v0.1.11)
