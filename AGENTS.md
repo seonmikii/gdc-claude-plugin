@@ -6,7 +6,7 @@ gdc-claude-plugin 작업 시 에이전트가 따르는 관제탑 규칙. 상세 
 
 - 의존성 동기화: `uv sync`
 - 의존성 추가: `uv add <패키지>` (직접 `pip install` 금지)
-- MCP 서버 단독 기동: `uv run --directory <플러그인 루트> gdc-mcp`
+- MCP 서버 단독 기동: `uv run --directory <플러그인 루트> python -m gdc_mcp.server` (`gdc-mcp` shim은 SAC 차단 대상이라 미사용)
 - 엔트리포인트: `gdc-mcp = gdc_mcp.server:main`
 - 패키지 관리는 **uv 고정** (npm/pip/poetry 사용 금지)
 - 자동화 테스트 없음 — 변경 검증은 MCP Inspector 또는 도구 직접 호출(자연어/프롬프트)로 수동 수행한다. 없는 테스트 명령을 지어내지 않는다.

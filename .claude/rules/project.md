@@ -14,7 +14,7 @@
 * **httpx**: gdc-service REST 호출
 * **python-dotenv**: 로컬 override(`.env`) 로딩
 * 빌드: **hatchling** / 엔트리포인트: `gdc-mcp = gdc_mcp.server:main`
-* 실행(서버 단독): `uv run --directory <플러그인 루트> gdc-mcp`
+* 실행(서버 단독): `uv run --directory <플러그인 루트> python -m gdc_mcp.server` (엔트리포인트 shim `gdc-mcp.exe`는 서명이 없어 Windows 스마트 앱 컨트롤에 차단되므로 사용하지 않는다)
 
 # 디렉터리 구조
 
@@ -47,6 +47,7 @@
 * 새 도구/프롬프트 추가 시 `server.py`에 FastMCP 데코레이터로 등록하고, **명확한 docstring/스키마**(파라미터 설명)를 작성한다. 자연어 호출이 가능하도록 설명을 구체적으로 쓴다.
 * 슬래시 커맨드(`/gdc-*`)와 MCP 프롬프트는 **대응 관계를 유지**한다(Desktop은 슬래시 커맨드 미지원 → 프롬프트로 동일 기능 제공).
 * gdc-service REST 호출은 `client.py`를 통해서 하고, 입력 검증(날짜 순서·미래 종료일 차단, 멤버 소속 확인 등)을 도구 레벨에서 수행한다.
+* **서버 기동·훅 명령은 `python -m gdc_mcp.server`를 사용한다.** uv가 생성하는 엔트리포인트 shim(`gdc-mcp.exe`)은 서명 없는 로컬 생성 파일이라 Windows 스마트 앱 컨트롤(SAC)에 차단된다(os error 4551). 새 명령/훅 추가 시 shim 호출을 넣지 않는다.
 
 ## 버전·배포 규칙
 * 사용자 노출 동작이 바뀌면 `.claude-plugin/plugin.json`의 `version`을 올린다.
