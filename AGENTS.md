@@ -9,7 +9,7 @@ gdc-claude-plugin 작업 시 에이전트가 따르는 관제탑 규칙. 상세 
 - MCP 서버 단독 기동: `uv run --directory <플러그인 루트> python -m gdc_mcp.server` (`gdc-mcp` shim은 SAC 차단 대상이라 미사용)
 - 엔트리포인트: `gdc-mcp = gdc_mcp.server:main`
 - 패키지 관리는 **uv 고정** (npm/pip/poetry 사용 금지)
-- 자동화 테스트 없음 — 변경 검증은 MCP Inspector 또는 도구 직접 호출(자연어/프롬프트)로 수동 수행한다. 없는 테스트 명령을 지어내지 않는다.
+- 테스트: **순수 로직**(`doc_utils`·server 헬퍼: 날짜/멤버 검증·본문 필터 등)은 pytest로 검증 — `uv run python -m pytest tests/`. **서버 연동·인증·도구 통합**은 MCP Inspector 또는 도구 직접 호출(자연어/프롬프트)로 수동 수행한다. `pytest` shim(`pytest.exe`)은 서명 없는 로컬 생성 파일이라 SAC 차단 대상 → 반드시 `python -m pytest` 형태로 실행한다(`gdc-mcp.exe`와 동일 함정). 없는 테스트 명령을 지어내지 않는다.
 
 ## Golden Rules
 
