@@ -356,16 +356,22 @@ def _validate_dates(
 
 
 def _resolve_members(
-    project_id: int, assignee: int | str | None, participant_ids: list[int | str] | None
+    project_id: int,
+    assignee: int | str | None,
+    participant_ids: list[int | str] | None,
+    project: dict | None = None,
 ) -> tuple[int | None, list[int] | None]:
     """담당자/관련자(user id 또는 이름)를 user id로 해석·검증한다.
 
     둘 다 없으면 조회를 생략하고 원본을 반환한다. 멤버가 아니거나 못 찾으면 ValueError로 안내.
+    project에 프로젝트 상세 응답을 넘기면 재조회 없이 재사용한다.
     """
     if assignee is None and not participant_ids:
         return assignee, participant_ids
 
-    members = client.get(f"/api/projects/{project_id}/").json().get("members", [])
+    if project is None:
+        project = client.get(f"/api/projects/{project_id}/").json()
+    members = project.get("members", [])
     ids = {m.get("user") for m in members}
     by_name: dict[str, int] = {}
     for m in members:
@@ -395,8 +401,57 @@ def _resolve_members(
     return r_assignee, r_parts
 
 
+# config/urls.py의 `api/customers/` prefix 아래에 router가 `customers`를 재등록해 경로가 중복된다.
+_CUSTOMERS = "/api/customers/customers/"
+
+
+def _ensure_wbs_weight(project: dict) -> None:
+    """비중(weight)은 WBS 프리셋 프로젝트 전용 — 서버 왕복 전에 차단한다."""
+    if project.get("preset") != "wbs":
+        raise ValueError(
+            f"비중(weight)은 WBS 프로젝트에서만 설정할 수 있습니다. "
+            f"'{project.get('name')}' 프로젝트의 preset은 '{project.get('preset')}'입니다."
+        )
+
+
+def _resolve_customer(workspace_id: int | None, customer: int | str) -> int:
+    """고객사(id 또는 이름)를 id로 해석한다.
+
+    search는 대표자·담당자 이름도 매칭하므로 고객사 이름 정확 일치(대소문자 무시)만
+    자동 채택하고 그 외는 후보 목록으로 안내한다. 열람 권한(can_view_customers)이 없는
+    워크스페이스는 서버가 403 대신 빈 결과를 주므로 0건은 권한 부재 가능성을 함께 안내한다.
+    """
+    if not isinstance(customer, bool) and (isinstance(customer, int) or str(customer).strip().isdigit()):
+        return int(customer)
+    name = str(customer).strip()
+    if workspace_id is None:
+        raise ValueError(
+            "고객사 이름 해석에는 워크스페이스 컨텍스트가 필요합니다. "
+            "gdc_login 또는 set_context 후 다시 시도하거나, 고객사 id로 직접 지정하세요."
+        )
+    data = client.get(
+        _CUSTOMERS, params={"workspace": workspace_id, "search": name, "page_size": 100}
+    ).json()
+    items = data.get("results", []) if isinstance(data, dict) else data
+    exact = [c for c in items if str(c.get("name", "")).strip().lower() == name.lower()]
+    if len(exact) == 1:
+        return exact[0]["id"]
+    candidates = exact or items
+    if candidates:
+        listing = ", ".join(f"{c.get('name')}(id={c['id']})" for c in candidates)
+        raise ValueError(
+            f"고객사 '{name}'이(가) 하나로 특정되지 않습니다. 후보: {listing} "
+            f"— 이름을 정확히 쓰거나 id로 지정하세요."
+        )
+    raise ValueError(
+        f"고객사 '{name}'을(를) 찾을 수 없습니다(미존재 또는 열람 권한 없음). "
+        f"고객사 id로 직접 지정할 수 있습니다."
+    )
+
+
 @mcp.tool
-def create_task(
+async def create_task(
+    ctx: Context,
     project: int,
     title: str,
     status: str | None = None,
@@ -406,6 +461,13 @@ def create_task(
     description: str | None = None,
     planned_start_date: str | None = None,
     planned_end_date: str | None = None,
+    actual_start_date: str | None = None,
+    actual_end_date: str | None = None,
+    progress: int | None = None,
+    parent: int | None = None,
+    customer: int | str | None = None,
+    weight: int | None = None,
+    tag_ids: list[int] | None = None,
     participant_ids: list[int | str] | None = None,
 ) -> dict:
     """태스크를 생성한다. 필수: project(프로젝트 ID), title.
@@ -421,15 +483,34 @@ def create_task(
     값 형식: status/priority/task_type은 해당 프로젝트 enum의 'name', 날짜는 'YYYY-MM-DD'.
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
 
-    제약(미충족 시 호출 전 ValueError로 안내·차단): 예상 시작일 ≤ 예상 종료일,
+    확장 필드(사용자가 명시할 때만 전달 — 질문으로 강요하지 않음):
+    parent(상위 태스크 id), customer(고객사 id **또는 이름** — 이름은 현재 워크스페이스에서
+    자동 해석, 모호하면 후보 안내), actual_start_date/actual_end_date, progress(0~100),
+    tag_ids(태그 id 리스트), weight(비중 % — **WBS 프로젝트 전용**, 비WBS는 호출 전 차단.
+    형제 그룹 비중 합 100 초과는 서버가 검증).
+
+    제약(미충족 시 호출 전 ValueError로 안내·차단): 예상/실제 시작일 ≤ 종료일, 실제 종료일 미래 불가,
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
 
-    완료 보정: status가 완료 계열(category=='done')이면 progress=100·실제 종료일=오늘을 자동 주입한다.
+    완료 보정: status가 완료 계열(category=='done')이면 progress=100·실제 종료일=오늘을 자동 주입한다
+    (progress/actual_end_date를 직접 전달한 경우 그 값이 우선).
     """
-    _validate_dates(planned_start_date, planned_end_date)
-    assignee, participant_ids = _resolve_members(project, assignee, participant_ids)  # id 또는 이름
+    _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
+    # 프로젝트 상세는 멤버 해석·WBS 가드·완료 카테고리 판정에 공용 — 필요할 때 1회만 조회
+    project_json = (
+        client.get(f"/api/projects/{project}/").json()
+        if (weight is not None or assignee is not None or participant_ids or status)
+        else None
+    )
+    if weight is not None:
+        _ensure_wbs_weight(project_json)
+    assignee, participant_ids = _resolve_members(
+        project, assignee, participant_ids, project=project_json
+    )  # id 또는 이름
     if assignee is None:
         assignee = _current_user_id()
+    if customer is not None:
+        customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
     fields: dict = {
         "project": project,
         "title": title,
@@ -440,12 +521,21 @@ def create_task(
         "description": description,
         "planned_start_date": planned_start_date,
         "planned_end_date": planned_end_date,
+        "actual_start_date": actual_start_date,
+        "actual_end_date": actual_end_date,
+        "progress": progress,
+        "parent": parent,
+        "customer": customer,
+        "weight": weight,
+        "tag_ids": tag_ids,
         "participant_ids": participant_ids,
     }
-    # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정
-    if status and _status_category(project, status) == "done":
-        fields["progress"] = 100
-        fields["actual_end_date"] = datetime.date.today().isoformat()
+    # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정 (명시 전달값 우선)
+    if status and _status_category(project, status, project=project_json) == "done":
+        if progress is None:
+            fields["progress"] = 100
+        if actual_end_date is None:
+            fields["actual_end_date"] = datetime.date.today().isoformat()
     payload = {k: v for k, v in fields.items() if v is not None}
     t = client.request("POST", _TASKS, json=payload).json()
     return {
@@ -459,8 +549,22 @@ def create_task(
     }
 
 
+# UI 수정 폼에서 비울 수 있는(nullable) 필드와 동일한 해제 허용 목록
+_CLEARABLE_FIELDS = {
+    "parent",
+    "assignee",
+    "customer",
+    "planned_start_date",
+    "planned_end_date",
+    "actual_start_date",
+    "actual_end_date",
+    "weight",
+}
+
+
 @mcp.tool
-def update_task(
+async def update_task(
+    ctx: Context,
     task_id: int,
     title: str | None = None,
     description: str | None = None,
@@ -473,27 +577,45 @@ def update_task(
     planned_end_date: str | None = None,
     actual_start_date: str | None = None,
     actual_end_date: str | None = None,
-    customer: int | None = None,
+    customer: int | str | None = None,
     parent: int | None = None,
+    weight: int | None = None,
     is_pinned: bool | None = None,
     tag_ids: list[int] | None = None,
     participant_ids: list[int | str] | None = None,
+    clear_fields: list[str] | None = None,
 ) -> dict:
     """태스크를 부분 수정(PATCH)한다. 전달한 필드만 갱신된다.
 
     사용자가 수정 권한을 가진 모든 편집 필드를 노출한다(읽기전용 id/number/creator 제외).
     status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인),
-    날짜는 'YYYY-MM-DD', customer/parent는 ID, tag_ids는 ID 리스트.
+    날짜는 'YYYY-MM-DD', parent는 ID, tag_ids는 ID 리스트.
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
+    customer는 고객사 id **또는 이름** — 이름은 현재 워크스페이스에서 검색해 정확 일치를 자동 채택,
+    모호하면 후보 목록으로 안내한다.
+    weight(비중 %)는 **WBS 프로젝트 전용** — 비WBS 태스크에 전달하면 호출 전 차단.
+    parent 변경 시 서버가 weight를 자동 초기화한다(weight를 함께 전달하면 그 값 적용).
     완료 상태(category=='done')로 전환하면 백엔드가 progress=100·actual_end_date를 자동 보정할 수 있다.
+
+    필드 해제(비우기): clear_fields에 필드명 리스트를 전달 — 가능: parent, assignee, customer,
+    planned_start_date, planned_end_date, actual_start_date, actual_end_date, weight.
+    예) 실제 종료일 비우기 → clear_fields=["actual_end_date"], 고객사 해제 → clear_fields=["customer"].
+    같은 필드에 값과 해제를 동시에 전달하면 오류. 관련자 전체 해제는 participant_ids=[].
 
     제약(미충족 시 ValueError로 안내·차단): 예상/실제 시작일 ≤ 종료일, 실제 종료일은 미래 불가,
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
     """
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
-    if assignee is not None or participant_ids:
+    if weight is not None or assignee is not None or participant_ids:
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
-        assignee, participant_ids = _resolve_members(project_id, assignee, participant_ids)  # id 또는 이름
+        project_json = client.get(f"/api/projects/{project_id}/").json()
+        if weight is not None:
+            _ensure_wbs_weight(project_json)
+        assignee, participant_ids = _resolve_members(
+            project_id, assignee, participant_ids, project=project_json
+        )  # id 또는 이름
+    if customer is not None:
+        customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
     payload = {
         k: v
         for k, v in {
@@ -510,12 +632,25 @@ def update_task(
             "actual_end_date": actual_end_date,
             "customer": customer,
             "parent": parent,
+            "weight": weight,
             "is_pinned": is_pinned,
             "tag_ids": tag_ids,
             "participant_ids": participant_ids,
         }.items()
         if v is not None
     }
+    if clear_fields:
+        unknown = [f for f in clear_fields if f not in _CLEARABLE_FIELDS]
+        if unknown:
+            raise ValueError(
+                f"해제(null)할 수 없는 필드: {', '.join(unknown)}. "
+                f"가능한 필드: {', '.join(sorted(_CLEARABLE_FIELDS))}"
+            )
+        conflict = [f for f in clear_fields if f in payload]
+        if conflict:
+            raise ValueError(f"같은 필드에 값과 해제를 동시에 전달할 수 없습니다: {', '.join(conflict)}")
+        for f in clear_fields:
+            payload[f] = None
     if not payload:
         raise ValueError("수정할 필드를 하나 이상 전달하세요.")
     t = client.request("PATCH", f"{_TASKS}{task_id}/", json=payload).json()
@@ -543,11 +678,18 @@ def open_task(task_id: int) -> dict:
     return {"opened": opened, "url": url, "browser": "chrome" if opened else "default"}
 
 
-def _status_category(project_id: int | None, status_name: str | None) -> str | None:
-    """프로젝트에서 status name의 category(planned/in_progress/done)를 찾는다."""
+def _status_category(
+    project_id: int | None, status_name: str | None, project: dict | None = None
+) -> str | None:
+    """프로젝트에서 status name의 category(planned/in_progress/done)를 찾는다.
+
+    project에 프로젝트 상세 응답을 넘기면 재조회 없이 재사용한다.
+    """
     if not project_id or not status_name:
         return None
-    for s in client.get(f"/api/projects/{project_id}/").json().get("task_statuses", []):
+    if project is None:
+        project = client.get(f"/api/projects/{project_id}/").json()
+    for s in project.get("task_statuses", []):
         if s.get("name") == status_name:
             return s.get("category")
     return None
