@@ -2,8 +2,8 @@
 
 gdc-service REST API를 Claude Code의 MCP 도구로 노출한다. 인증은 브라우저 핸드오프 전용.
 도구: gdc_login / get_context / set_context / list_workspaces / list_projects /
-      get_project_enums / list_my_tasks / create_task / update_task / get_task /
-      open_task / link_task_to_doc / sync_doc_progress / task_from_doc
+      list_customers / get_project_enums / list_my_tasks / create_task / update_task /
+      get_task / open_task / link_task_to_doc / sync_doc_progress / task_from_doc
 """
 
 from __future__ import annotations
@@ -155,6 +155,42 @@ def list_projects(workspace_id: int) -> dict:
     data = client.get("/api/projects/", params={"workspace": workspace_id, "page_size": 100}).json()
     items = data.get("results", []) if isinstance(data, dict) else data
     return {"projects": [{"id": p["id"], "name": p.get("name")} for p in items]}
+
+
+@mcp.tool
+async def list_customers(ctx: Context, search: str | None = None) -> dict:
+    """현재 레포 컨텍스트 워크스페이스의 고객사 목록을 조회한다.
+
+    create_task/update_task의 customer를 이름으로 지정하기 전에 후보를 확인하는 용도.
+    search를 주면 이름·대표자·담당자 이름으로 부분 검색한다(생략 시 전체).
+    반환된 id 또는 name을 customer 인자로 넘기면 된다.
+
+    권한(고객사 열람) 없는 워크스페이스는 서버가 빈 목록을 주므로 count=0이면
+    고객사가 없거나 열람 권한이 없는 것이다.
+    """
+    workspace_id = (await _resolve_context(ctx)).get("workspace_id")
+    if workspace_id is None:
+        raise ValueError(
+            "워크스페이스 컨텍스트가 없습니다. gdc_login 또는 set_context로 워크스페이스를 선택하세요."
+        )
+    params: dict[str, str | int] = {"workspace": workspace_id, "page_size": 100}
+    if search:
+        params["search"] = search
+    data = client.get(_CUSTOMERS, params=params).json()
+    items = data.get("results", []) if isinstance(data, dict) else data
+    return {
+        "workspace_id": workspace_id,
+        "count": len(items),
+        "customers": [
+            {
+                "id": c["id"],
+                "name": c.get("name"),
+                "primary_contact_name": c.get("primary_contact_name") or None,
+            }
+            for c in items
+        ],
+        "hint": None if items else "결과 없음 — 고객사 미존재이거나 이 워크스페이스 고객사 열람 권한이 없습니다.",
+    }
 
 
 @mcp.tool

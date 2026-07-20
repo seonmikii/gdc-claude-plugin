@@ -32,3 +32,4 @@
 2026-07-06 | infra | infra/config | done | 2026-07/20260706-165536-prod-server-switch.md | 기본 연결 대상을 운영 서버(https://gdc.gemiso.com)로 변경 (.mcp.json·README·rules, v0.1.11)
 2026-07-16 | fix | infra/mcp | done | 2026-07/20260716-151731-sac-block-fix.md | Windows SAC 차단 해결 — 서명 없는 gdc-mcp shim 대신 python -m gdc_mcp.server 기동으로 전환 (.mcp.json·hooks, v0.1.12)
 2026-07-20 | feat | server/api | done | 2026-07/20260720-150845-update-task-full-edit-fields.md | create/update_task 편집 필드 UI 동등화 — weight(WBS 가드)·customer 이름 해석·clear_fields 해제·create 확장 (v0.2.0)
+2026-07-20 | feat | server/api | done | 2026-07/20260720-161506-list-customers-tool.md | list_customers 도구 추가 — 현재 워크스페이스 고객사 목록 조회(검색 옵션), customer 이름 지정 보조 (v0.2.1)
