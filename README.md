@@ -34,24 +34,19 @@
 
 ### 업데이트 (새 버전 반영)
 
-플러그인이 갱신되면 아래 커맨드로 마켓플레이스 갱신 + 최신 버전 승격을 안내받는다. `/gdc-update`는 실행 환경(터미널 CLI / VSCode 확장)을 감지해 알맞은 방법으로 안내한다.
+플러그인 업데이트는 **터미널 CLI에서만** 된다. 아래 두 명령을 실행하고 Claude Code를 재시작한다.
 
+```sh
+claude plugin marketplace update gdc-marketplace
+claude plugin update gdc-claude-plugin@gdc-marketplace
 ```
-/gdc-update
-```
 
-> **VSCode 확장 환경**: 확장은 `claude` 바이너리를 셸 PATH에 올리지 않아 CLI 자동실행이 안 된다(`command not found`). 또한 CLI용 `/plugin`(단수) 커맨드는 확장에 없으니(`isn't available in this environment`), **`/plugins`(복수) GUI**로 업데이트한다.
-> 1. 프롬프트 박스에 `/plugins`(복수) 입력 → **Manage plugins** 창
-> 2. **Marketplaces** 탭 → `gdc-marketplace` 옆 **새로고침 아이콘** 클릭
-> 3. **Plugins** 탭에서 `gdc-claude-plugin` 최신 버전 확인 → 안내 배너대로 Claude Code 재시작
+> `/plugin install`은 이미 설치된 경우 새 버전으로 **승격되지 않으니**(`already installed`) 반드시 `update`를 쓴다.
 
-> **터미널 CLI 폴백(부트스트랩)**: `/gdc-update` 커맨드가 없거나(구버전) 승격이 안 되면, 터미널에서 직접 실행한다. `/plugin install`은 이미 설치된 경우 새 버전으로 **승격되지 않으니**(`already installed`) 반드시 `update`를 쓴다.
-> ```sh
-> claude plugin marketplace update gdc-marketplace
-> claude plugin update gdc-claude-plugin@gdc-marketplace
-> ```
+> **⚠️ VSCode 확장에서는 업데이트가 안 된다.** 확장은 `claude` 바이너리를 셸 PATH에 올리지 않고(CLI 미존재), CLI용 `/plugin` 커맨드도 없으며, `/plugins` GUI의 마켓플레이스 새로고침은 캐시만 받을 뿐 설치 버전 포인터(`installed_plugins.json`)를 승격하지 않는다. 따라서 `/gdc-update` 커맨드도 확장에서는 실제 업데이트를 수행하지 못한다.
+> **업데이트하려면 CLI를 쓴다** — [standalone CLI](https://code.claude.com/docs/en/setup)를 설치한 뒤 VSCode 통합 터미널(`` Ctrl+` ``)에서 위 두 명령을 실행하고 Claude Code를 재시작한다.
 
-> 설치/업데이트가 `EBUSY: resource busy or locked` 로 막히면, 실행 중인 MCP 서버가 캐시 폴더를 점유한 것이다. `/plugin`에서 플러그인을 **Disable 후 재설치**하거나, Claude Code를 **완전 재시작**한 뒤 다시 설치한다.
+> 설치/업데이트가 `EBUSY: resource busy or locked` 로 막히면, 실행 중인 MCP 서버가 캐시 폴더를 점유한 것이다. 플러그인을 **Disable 후 재설치**하거나, Claude Code를 **완전 재시작**한 뒤 다시 실행한다.
 
 ### 인증 (브라우저 핸드오프)
 
