@@ -22,6 +22,7 @@ from .handoff import browser_handoff, open_in_chrome
 from .doc_utils import (
     compute_phase_progress,
     extract_title,
+    normalize_description,
     read_frontmatter,
     read_metadata_table,
     upsert_frontmatter,
@@ -547,6 +548,7 @@ async def create_task(
         assignee = _current_user_id()
     if customer is not None:
         customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
+    description = normalize_description(description)  # 평문→HTML 변환(이미 HTML이면 통과)
     fields: dict = {
         "project": project,
         "title": title,
@@ -652,6 +654,7 @@ async def update_task(
         )  # id 또는 이름
     if customer is not None:
         customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
+    description = normalize_description(description)  # 평문→HTML 변환(이미 HTML이면 통과)
     payload = {
         k: v
         for k, v in {
@@ -807,7 +810,7 @@ def _apply_progress_sync(task_id: int, new_progress: int, description: str | Non
     today = datetime.date.today().isoformat()
     payload: dict = {"progress": new_progress}
     if description is not None:
-        payload["description"] = description
+        payload["description"] = normalize_description(description)  # 평문→HTML(이미 HTML이면 통과)
 
     if old_progress == 0 and new_progress > 0 and not cur.get("actual_start_date"):
         payload["actual_start_date"] = today
@@ -940,14 +943,24 @@ async def task_from_doc(
     """작업 요청 문서로 태스크를 생성하고, 문서 frontmatter에 task_id/task_url을 기록한다.
 
     - 제목: 문서의 첫 '# ' 헤딩에서 추출.
-    - description(필수): 호출하는 에이전트가 아래 템플릿으로 작성해 전달한다(태스크 본문으로 저장):
-        작업 문서의 "요청 내용" 한 줄 요약
+    - description(필수): 호출하는 에이전트가 아래 라벨 섹션 템플릿(평문)으로 작성해 전달한다.
+      도구가 GDC 리치텍스트(HTML)로 변환해 저장한다(라벨→문단, 블렛→목록, 섹션 사이 빈 문단).
+        [요약]
+        문서 "요청 내용" 한두 줄 요약
+
+        [AS-IS]        ← 선택(TO-BE와 짝): '요청 내용'·'배경'에서 구현 전 상황이 실제로 드러날 때만
+        구현 전 상황
+
+        [TO-BE]        ← 선택(AS-IS와 짝)
+        구현 후 상황
 
         [작업 내용]
         - 작업 결과 단계를 블렛(`-`)으로 간단히 요약 (각 단계 한 줄)
-        ※ 체크박스 표시(`[ ]`/`[x]`)는 넣지 않는다. 진행 상태는 태스크 progress 필드가 담당한다.
-        ※ 빌드·타입체크·검증·테스트·lint·커밋·배포/동작 확인·'INDEX.md 이력 추가' 같은
-          프로세스 메타 단계는 넣지 않는다(실제 산출물 단계만). 넣더라도 도구가 자동 제거한다.
+      ※ [요약]·[작업 내용]=필수, [AS-IS]/[TO-BE]=선택(짝). 전/후 상황이 불명확하면 생략(추측·빈말 금지) —
+        신규 기능·문서 작업엔 보통 빠진다.
+      ※ 체크박스 표시(`[ ]`/`[x]`)는 넣지 않는다. 진행 상태는 태스크 progress 필드가 담당한다.
+      ※ 빌드·타입체크·검증·테스트·lint·커밋·배포/동작 확인·'INDEX.md 이력 추가' 같은
+        프로세스 메타 단계는 넣지 않는다(실제 산출물 단계만). 넣더라도 도구가 자동 제거한다.
     - status: 생략 시 문서 메타데이터 표의 `상태`를 보고 매핑한다 —
       **done → '완료'(완료/closed 계열)**, **partial → '진행'(in_progress)**.
       그 외 값은 자동 매핑하지 않고 기본 상태로 둔다. status 인자를 주면 그 값이 우선한다.
@@ -968,6 +981,7 @@ async def task_from_doc(
         }
 
     description = _strip_meta_steps(description)  # 메타 단계 블렛 방어적 제거
+    description = normalize_description(description)  # 라벨 템플릿 → GDC 리치텍스트(HTML)(공통 진입점)
 
     title = extract_title(text)
     if not title:
@@ -1085,7 +1099,9 @@ def gdc_task_new(request: str = "") -> str:
         "1. `get_context`로 현재 레포의 project_id 확인(없으면 gdc_login 안내).\n"
         "2. `get_project_enums(project_id)`로 status/priority/task_type/members(관련자 후보 id·name) 조회. "
         "보기는 한글 `label`, create_task에 넘길 값은 `name`. 목록은 프로젝트별 동적(커스텀 포함).\n"
-        "3. 제목·내용을 입력에서 받거나 한 번 물어봅니다(자유 입력).\n"
+        "3. 제목·내용(description)을 입력에서 받거나 한 번 물어봅니다. 내용은 **라벨 섹션 템플릿(평문)**으로 "
+        "정리하면 도구가 GDC 리치텍스트(HTML)로 변환합니다 — `[요약]` 한두 줄 요약 → (선택·짝) `[AS-IS]`/`[TO-BE]` → "
+        "`[작업 내용]` 아래 `-` 블렛(각 한 줄). 이미 HTML로 작성하면 그대로 전송됩니다(이중 변환 없음).\n"
         "4. status/priority/task_type/관련자를 선택 질문(AskUserQuestion)으로 한 호출에 함께 묻습니다. "
         "각 질문은 실제 값 최대 3개 + '건너뛰기', 나머지 값은 설명에 나열하고 '기타'로 입력하게 합니다. "
         "새 태스크는 미완료 상태(등록/진행/검토)를 우선 노출하고 완료 계열은 기타로. "
@@ -1101,15 +1117,21 @@ def gdc_task_from_doc(path: str = "") -> str:
     """작업 요청 문서로 태스크 생성."""
     return (
         f"지정한 작업 요청 문서로 태스크를 생성합니다. 경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
-        "1. description을 템플릿에 맞춰 작성: 첫 줄 = 문서 '요청 내용' 한 줄 요약, 다음 '[작업 내용]' 아래 '작업 결과' 단계를 "
-        "블렛(`-`)으로 간단히 요약(각 단계 한 줄). **체크박스 표시(`[ ]`/`[x]`)는 넣지 말 것** — 진행 상태는 progress 필드 담당. "
-        "**빌드·타입체크·검증·테스트·lint·커밋·배포/동작 확인·'INDEX.md 이력 추가' 같은 프로세스 메타 단계는 본문에 넣지 말 것**"
-        "(실제 산출물 단계만; 원본 문서 '작업 결과'에 그런 단계가 있어도 옮기지 않는다). 넣더라도 도구가 자동 제거한다.\n"
+        "1. description을 **라벨 섹션 템플릿(평문)**으로 작성합니다(도구가 GDC 리치텍스트(HTML)로 변환):\n"
+        "   `[요약]` 문서 '요청 내용' 한두 줄 요약 → `[AS-IS]`/`[TO-BE]`(선택·짝: '요청 내용'·'배경'에서 전/후 상황이 "
+        "실제로 드러날 때만; 불명확하면 생략) → `[작업 내용]` 아래 '작업 결과' 단계를 블렛(`-`)으로 요약(각 단계 한 줄).\n"
+        "   **체크박스(`[ ]`/`[x]`)는 넣지 말 것**(진행 상태는 progress 필드 담당). "
+        "**빌드·타입체크·검증·테스트·lint·커밋·배포/동작 확인·'INDEX.md 이력 추가' 같은 프로세스 메타 단계는 넣지 말 것**"
+        "(실제 산출물 단계만; 원본 '작업 결과'에 있어도 옮기지 않는다). 넣더라도 도구가 자동 제거한다.\n"
         "2. `get_project_enums(project_id)`로 `task_type` 목록을 조회해, 문서 메타표 `유형`+본문 내용에 가장 맞는 enum name을 "
-        "`task_type` 인자로 넘깁니다(확실하지 않으면 생략).\n"
-        "3. `task_from_doc` 도구 호출. project는 현재 레포 컨텍스트(gdc_login 저장값)에서 자동 결정됩니다. "
+        "`task_type` 인자로 정합니다(확실하지 않으면 생략).\n"
+        "3. **생성 전 미리보기 + 단일 확인(항상)**: 태스크 생성 직전에 아래를 표로 보여주고 **한 번 확인**받습니다 — "
+        "제목 / 렌더링될 본문(요약·AS-IS/TO-BE·작업 내용) / 상태 / 유형 / **우선순위**(priority; 기본 미지정). "
+        "사용자가 원하는 항목(특히 우선순위)을 그 자리에서 바꿔 요청하면 반영해 다시 확인합니다.\n"
+        "4. 확인 후 `task_from_doc` 도구 호출(변경된 우선순위/유형이 있으면 `priority`/`task_type` 인자로 전달). "
+        "project는 현재 레포 컨텍스트(gdc_login 저장값)에서 자동 결정됩니다. "
         "메타데이터 표의 `상태`는 자동 매핑: done→'완료', partial→'진행'. 완료 매핑 시 progress=100·실제 종료일=오늘이 자동 주입됩니다.\n"
-        "4. 생성 결과(task_id/URL)와 문서 frontmatter 갱신 여부를 보고합니다."
+        "5. 생성 결과(task_id/URL)와 문서 frontmatter 갱신 여부를 보고합니다."
     )
 
 

@@ -12,7 +12,7 @@ description: 새 태스크 생성 (선택 목록·한글·담당자 자동)
 절차:
 1. `get_context`로 현재 레포의 project_id 확인(없으면 `/gdc-login` 안내).
 2. `get_project_enums(project_id)`로 status / priority / task_type / **members**(관련자 후보: id·name) 조회. 보기는 한글 `label`, `create_task`에 넘길 값은 `name`. 목록은 프로젝트별 동적(커스텀 포함).
-3. **제목·내용**을 $ARGUMENTS에서 받거나 한 번 물어봅니다(자유 입력).
+3. **제목·내용(description)**을 $ARGUMENTS에서 받거나 한 번 물어봅니다. 내용은 **라벨 섹션 템플릿(평문)**으로 정리하면 도구가 GDC 리치텍스트(HTML)로 변환합니다 — `[요약]` 한두 줄 요약 → (선택·짝) `[AS-IS]`/`[TO-BE]` → `[작업 내용]` 아래 `-` 블렛(각 한 줄). 이미 HTML로 작성하면 그대로 전송됩니다(이중 변환 없음).
 4. status / priority / task_type / **관련자**를 **선택 질문(AskUserQuestion)**으로 한 호출에 함께 묻습니다.
    - 각 질문은 **실제 값 최대 3개 + "건너뛰기"**. 값이 4개 이상이어도 다 채우지 말고 3개만, 나머지는 설명에 나열해 **"기타"(Other)**로 입력하게 합니다.
    - 새 태스크는 미완료 상태(등록/진행/검토)를 우선 노출, 완료 계열(해결/완료)은 기타로.
