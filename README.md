@@ -34,7 +34,13 @@
 
 ### 업데이트 (새 버전 반영)
 
-플러그인 업데이트는 **터미널 CLI에서만** 된다. 아래 두 명령을 실행하고 Claude Code를 재시작한다.
+플러그인 업데이트는 **터미널 CLI에서** 한다. CLI 세션에서는 `/gdc-update` 커맨드가 `claude`를 감지해 아래 두 명령을 대신 실행해준다.
+
+```
+/gdc-update
+```
+
+또는 두 명령을 직접 실행해도 된다(둘 다 CLI 전용). 실행 후 Claude Code를 재시작한다.
 
 ```sh
 claude plugin marketplace update gdc-marketplace
