@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 from pathlib import Path
 
@@ -15,6 +16,91 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _PHASE_HEADING_RE = re.compile(r"^#{2,4}\s*(?:Phase|단계)\b.*$", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^#{1,6}\s")
 _CHECKBOX_RE = re.compile(r"^\s*[-*]\s*\[( |x|X)\]\s")
+_LABEL_RE = re.compile(r"^\[(.+)\]$")
+_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+)$")
+# 이미 HTML(리치텍스트)인지 판별용 — 실제 태그명 뒤가 와야 매칭(평문의 'a < b'는 미매칭)
+_HTML_TAG_RE = re.compile(
+    r"</?(?:p|br|ul|ol|li|div|span|strong|em|b|i|a|h[1-6]|table|thead|tbody|tr|td|th|blockquote|pre|code)\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_description(text: str | None) -> str | None:
+    """태스크 description을 GDC 리치텍스트(HTML)로 정규화한다(생성/수정/동기화 공통 진입점).
+
+    GDC는 description을 모든 경로에서 HTML로 저장·렌더링하므로, 평문을 그대로 보내면 줄바꿈이
+    무시돼 본문이 뭉개진다. 이 래퍼를 모든 경로가 공유해 일관되게 변환하되, **이미 HTML인 입력은
+    그대로 통과**시켜 이중 변환(예: 이미 변환된 `task_from_doc` 산출물, 에이전트가 직접 넘긴 HTML)을 막는다.
+
+    - None → None (변경 없음/필드 생략 신호를 그대로 전달).
+    - 블록/인라인 태그가 있으면 이미 HTML로 보고 **그대로 통과**.
+    - 그 외 평문은 `description_to_html`로 변환.
+
+    주의: 평문에 리터럴 태그 문자열(예: 문장 속 `<p>`)이 있으면 HTML로 오판할 수 있다(희귀).
+    확실히 변환이 필요하면 라벨 섹션 템플릿(평문)을 쓴다.
+    """
+    if text is None:
+        return None
+    if _HTML_TAG_RE.search(text):
+        return text  # 이미 HTML — 통과
+    return description_to_html(text)
+
+
+def description_to_html(text: str) -> str:
+    """라벨 섹션 템플릿(평문)을 GDC 리치텍스트(HTML)로 변환한다.
+
+    GDC의 description은 리치텍스트 에디터(HTML)로 저장·렌더링되므로(실증 확인: 태스크
+    #292/#273), 평문 `\\n`/`-`를 그대로 보내면 줄바꿈이 무시돼 한 줄로 뭉개지고 하이픈이
+    글자 그대로 보인다. 다음 규칙으로 변환한다(GDC 에디터 산출 형식과 정렬):
+
+    - `[라벨]` 줄 → `<p><strong>라벨</strong></p>` (대괄호 제거, 라벨 볼드 — GDC가 <strong> 지원)
+    - 일반 텍스트 줄 → `<p>...</p>`
+    - `-`/`*` 블렛 줄 → `<ul><li><p>...</p></li>...</ul>` (연속 블렛은 하나의 `<ul>`)
+    - 빈 줄로 구분된 섹션 사이 → 빈 문단 `<p></p>`
+    - 모든 텍스트 내용은 `&`·`<`·`>`를 이스케이프한다.
+
+    빈 입력(공백만 포함 포함)은 빈 문자열을 반환한다.
+    """
+    # 빈 줄 기준으로 섹션 분할
+    sections: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.strip() == "":
+            if current:
+                sections.append(current)
+                current = []
+        else:
+            current.append(line)
+    if current:
+        sections.append(current)
+
+    def _ul(items: list[str]) -> str:
+        return "<ul>" + "".join(f"<li><p>{b}</p></li>" for b in items) + "</ul>"
+
+    html_sections: list[str] = []
+    for sec in sections:
+        parts: list[str] = []
+        bullets: list[str] = []
+        for line in sec:
+            mb = _BULLET_RE.match(line)
+            if mb:
+                bullets.append(html.escape(mb.group(1).strip(), quote=False))
+                continue
+            if bullets:  # 블렛이 아닌 줄을 만나면 열린 <ul>을 닫는다
+                parts.append(_ul(bullets))
+                bullets = []
+            stripped = line.strip()
+            ml = _LABEL_RE.match(stripped)
+            if ml:  # 라벨은 볼드 처리(GDC <strong> 지원 확인)
+                label = html.escape(ml.group(1).strip(), quote=False)
+                parts.append(f"<p><strong>{label}</strong></p>")
+            else:
+                parts.append(f"<p>{html.escape(stripped, quote=False)}</p>")
+        if bullets:
+            parts.append(_ul(bullets))
+        html_sections.append("".join(parts))
+
+    return "<p></p>".join(html_sections)
 
 
 def read_frontmatter(text: str) -> dict[str, str]:
