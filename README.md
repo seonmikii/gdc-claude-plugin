@@ -34,13 +34,18 @@
 
 ### 업데이트 (새 버전 반영)
 
-플러그인이 갱신되면 아래 커맨드 한 번으로 마켓플레이스 갱신 + 최신 버전 승격을 한다.
+플러그인이 갱신되면 아래 커맨드로 마켓플레이스 갱신 + 최신 버전 승격을 안내받는다. `/gdc-update`는 실행 환경(터미널 CLI / VSCode 확장)을 감지해 알맞은 방법으로 안내한다.
 
 ```
 /gdc-update
 ```
 
-> **수동 폴백(부트스트랩)**: `/gdc-update` 커맨드가 없거나(구버전) 승격이 안 되면, 터미널에서 직접 실행한다. `/plugin install`은 이미 설치된 경우 새 버전으로 **승격되지 않으니**(`already installed`) 반드시 `update`를 쓴다.
+> **VSCode 확장 환경**: 확장은 `claude` 바이너리를 셸 PATH에 올리지 않아 CLI 자동실행이 안 된다(`command not found`). 또한 CLI용 `/plugin`(단수) 커맨드는 확장에 없으니(`isn't available in this environment`), **`/plugins`(복수) GUI**로 업데이트한다.
+> 1. 프롬프트 박스에 `/plugins`(복수) 입력 → **Manage plugins** 창
+> 2. **Marketplaces** 탭 → `gdc-marketplace` 옆 **새로고침 아이콘** 클릭
+> 3. **Plugins** 탭에서 `gdc-claude-plugin` 최신 버전 확인 → 안내 배너대로 Claude Code 재시작
+
+> **터미널 CLI 폴백(부트스트랩)**: `/gdc-update` 커맨드가 없거나(구버전) 승격이 안 되면, 터미널에서 직접 실행한다. `/plugin install`은 이미 설치된 경우 새 버전으로 **승격되지 않으니**(`already installed`) 반드시 `update`를 쓴다.
 > ```sh
 > claude plugin marketplace update gdc-marketplace
 > claude plugin update gdc-claude-plugin@gdc-marketplace
