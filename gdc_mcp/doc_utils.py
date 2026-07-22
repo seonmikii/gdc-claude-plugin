@@ -103,6 +103,31 @@ def description_to_html(text: str) -> str:
     return "<p></p>".join(html_sections)
 
 
+# 블록 경계(문단·목록·줄바꿈 등)를 줄바꿈으로 치환할 태그 — 조회한 리치텍스트를 읽기용 평문으로.
+_BLOCK_END_RE = re.compile(
+    r"(?i)<\s*br\s*/?\s*>|</\s*(?:p|div|li|h[1-6]|tr|blockquote|pre)\s*>"
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_MULTI_BLANK_RE = re.compile(r"\n{3,}")
+
+
+def html_to_text(content: str | None) -> str:
+    """조회한 리치텍스트(HTML) content를 터미널 표시용 평문으로 변환한다.
+
+    GDC 댓글(content)은 HTML로 저장되므로 그대로 보여주면 태그가 노출된다. 블록 태그(</p>,
+    <br>, <li> 등)는 줄바꿈으로 바꾸고 나머지 태그는 제거한 뒤, HTML 엔티티를 unescape한다.
+    빈/None 입력은 빈 문자열을 반환한다.
+    """
+    if not content:
+        return ""
+    text = _BLOCK_END_RE.sub("\n", content)
+    text = _TAG_RE.sub("", text)
+    text = html.unescape(text)
+    # 줄별 좌우 공백 제거 후 3줄 이상 연속 빈 줄은 1개로 축약
+    text = "\n".join(line.strip() for line in text.splitlines())
+    return _MULTI_BLANK_RE.sub("\n\n", text).strip()
+
+
 def read_frontmatter(text: str) -> dict[str, str]:
     m = _FRONTMATTER_RE.match(text)
     if not m:

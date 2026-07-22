@@ -13,6 +13,7 @@ import os
 import re
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 
@@ -22,6 +23,7 @@ from .handoff import browser_handoff, open_in_chrome
 from .doc_utils import (
     compute_phase_progress,
     extract_title,
+    html_to_text,
     normalize_description,
     read_frontmatter,
     read_metadata_table,
@@ -34,6 +36,7 @@ mcp = FastMCP("gdc-local")
 client = GdcClient()
 
 _TASKS = "/api/tasks/tasks/"
+_MENTIONS = "/api/tasks/mentions/"
 
 # 사용자에게 보여줄 링크는 백엔드(API)가 아니라 프론트엔드(웹) 주소여야 한다.
 _WEB_URL = os.environ.get("GDC_WEB_URL", "http://localhost:5173").rstrip("/")
@@ -1028,6 +1031,166 @@ async def task_from_doc(
         "url": url,
         "doc_updated": True,
     }
+
+
+# --- 태스크 댓글(Mention) -------------------------------------------------------
+# gdc-service의 댓글은 Mention 모델(/api/tasks/mentions/). content는 리치텍스트(HTML)이고,
+# 서버가 content의 `@username`을 파싱해 멘션 알림(task_commented)을 발송한다. 수정/삭제는
+# 작성자 본인만 가능(403). 이 레포는 클라이언트 — 서버는 미수정.
+
+
+def _resolve_mention_usernames(
+    project_id: int,
+    mentions: list[int | str] | None,
+    project: dict | None = None,
+) -> list[str]:
+    """멘션 대상(멤버 이름 또는 user id)을 프로젝트 멤버의 username 리스트로 해석한다.
+
+    비멤버는 _resolve_members와 동일하게 가능한 멤버 목록과 함께 ValueError로 안내한다.
+    project에 프로젝트 상세 응답을 넘기면 재조회 없이 재사용한다.
+    """
+    if not mentions:
+        return []
+    if project is None:
+        project = client.get(f"/api/projects/{project_id}/").json()
+    members = project.get("members", [])
+    by_id: dict[int, str | None] = {}
+    by_name: dict[str, str | None] = {}
+    for m in members:
+        uname = m.get("username")
+        if m.get("user") is not None:
+            by_id[m["user"]] = uname
+        for nm in (m.get("full_name"), m.get("username")):
+            if nm:
+                by_name[str(nm).strip().lower()] = uname
+
+    resolved: list[str] = []
+    for value in mentions:
+        if not isinstance(value, bool) and (isinstance(value, int) or str(value).strip().isdigit()):
+            uname = by_id.get(int(value))
+        else:
+            uname = by_name.get(str(value).strip().lower())
+        if not uname:
+            valid = ", ".join(
+                f"{(m.get('full_name') or m.get('username'))}(id={m.get('user')})" for m in members
+            )
+            raise ValueError(
+                f"멘션 대상 '{value}'은(는) 이 프로젝트의 멤버가 아닙니다. 가능한 멤버: {valid or '(없음)'}"
+            )
+        resolved.append(uname)
+    return resolved
+
+
+def _build_comment_html(content: str, usernames: list[str]) -> str:
+    """본문을 GDC 리치텍스트(HTML)로 변환하고, 멘션이 있으면 `@user…` 문단을 선두에 붙인다.
+
+    서버가 content의 `@username`을 파싱하므로, HTML 문단으로 감싸도 정규식이 사용자명을 찾는다.
+    """
+    html = normalize_description(content) or ""
+    if usernames:
+        prefix = " ".join(f"@{u}" for u in usernames)
+        html = f"<p>{prefix}</p>{html}"
+    return html
+
+
+@mcp.tool
+def list_task_comments(task_id: int, limit: int = 20) -> dict:
+    """태스크의 댓글(멘션) 목록을 조회한다. 최신순 상위 limit개를 시간순(오래된→최신)으로 반환.
+
+    서버 페이지네이션(PAGE_SIZE=20, page_size 미지원)상 **한 요청으로 최대 20개**만 받는다 —
+    limit>20을 줘도 20개까지만 반환된다(가장 최근 댓글 우선). count는 태스크의 전체 댓글 수.
+
+    각 댓글: id, author_name(작성자 실명), text(HTML을 벗긴 평문), is_edited(수정됨 여부), created_at.
+    """
+    data = client.get(_MENTIONS, params={"task": task_id, "ordering": "-created_at"}).json()
+    if isinstance(data, dict):
+        page = data.get("results", [])
+        total = data.get("count", len(page))
+    else:  # 페이지네이션 비활성(리스트) 방어
+        page = data
+        total = len(page)
+    recent = list(reversed(page[:limit]))  # 최신 limit개를 시간순으로 표시
+    comments = [
+        {
+            "id": c["id"],
+            "author_name": c.get("author_name"),
+            "text": html_to_text(c.get("content")),
+            "is_edited": c.get("is_edited"),
+            "created_at": c.get("created_at"),
+        }
+        for c in recent
+    ]
+    return {"count": total, "shown": len(comments), "comments": comments}
+
+
+@mcp.tool
+def add_task_comment(
+    task_id: int, content: str, mentions: list[int | str] | None = None
+) -> dict:
+    """태스크에 댓글(멘션)을 작성한다. 필수: task_id, content(본문).
+
+    content는 평문으로 넘기면 GDC 리치텍스트(HTML)로 변환해 저장한다(이미 HTML이면 통과).
+    mentions에 멤버 이름 또는 user id 리스트를 주면 각 멤버의 username으로 해석해
+    본문 맨 앞에 `@user1 @user2` 한 줄을 붙인다 → 서버가 이를 파싱해 멘션 알림을 발송한다.
+    (멘션은 본문 선두에만 배치되며, 본문 중간 커서 위치 삽입은 지원하지 않는다.)
+    비멤버를 멘션하면 가능한 멤버 목록과 함께 오류로 안내한다.
+    """
+    usernames: list[str] = []
+    if mentions:
+        project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
+        usernames = _resolve_mention_usernames(project_id, mentions)
+    content_html = _build_comment_html(content, usernames)
+    m = client.request(
+        "POST", _MENTIONS, json={"task": task_id, "content": content_html}
+    ).json()
+    return {
+        "id": m["id"],
+        "author_name": m.get("author_name"),
+        "created_at": m.get("created_at"),
+    }
+
+
+@mcp.tool
+def update_task_comment(
+    comment_id: int, content: str, mentions: list[int | str] | None = None
+) -> dict:
+    """댓글(멘션) 본문을 수정한다. **본인이 작성한 댓글만 수정 가능**(아니면 오류).
+
+    주의: 서버가 새 content로 멘션을 **다시 파싱해 덮어쓴다**. 기존 멘션을 유지하려면
+    mentions 인자로 함께 넘겨야 하며, mentions 없이 수정하면 이전 멘션 알림 대상이 사라진다.
+    content는 평문→HTML 자동 변환(이미 HTML이면 통과).
+    """
+    usernames: list[str] = []
+    if mentions:
+        task_id = client.get(f"{_MENTIONS}{comment_id}/").json().get("task")
+        project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
+        usernames = _resolve_mention_usernames(project_id, mentions)
+    content_html = _build_comment_html(content, usernames)
+    try:
+        m = client.request(
+            "PATCH", f"{_MENTIONS}{comment_id}/", json={"content": content_html}
+        ).json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            raise ValueError("본인이 작성한 댓글만 수정할 수 있습니다.") from e
+        raise
+    return {
+        "id": m["id"],
+        "is_edited": m.get("is_edited"),
+        "updated_at": m.get("updated_at"),
+    }
+
+
+@mcp.tool
+def delete_task_comment(comment_id: int) -> dict:
+    """댓글(멘션)을 삭제한다. **본인이 작성한 댓글만 삭제 가능**(아니면 오류)."""
+    try:
+        client.request("DELETE", f"{_MENTIONS}{comment_id}/")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            raise ValueError("본인이 작성한 댓글만 삭제할 수 있습니다.") from e
+        raise
+    return {"deleted": True, "comment_id": comment_id}
 
 
 # --- 프롬프트(슬래시 커맨드) — Claude Desktop·Code 양쪽에서 사용 -------------------
