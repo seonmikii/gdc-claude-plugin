@@ -1315,7 +1315,10 @@ def gdc_doc_from_task(task_id: str = "") -> str:
         "done→done·in_progress→partial·그 외→partial, 유형/영역은 합리적으로), 요청 내용=②기획 정리 결과, 작업 결과=③개발 계획 체크리스트.\n"
         f"   문서 맨 위 frontmatter에 `task_id: {task_id}`, `task_url: <url>`을 기록해 연동합니다.\n"
         "4. 경로: `docs/requests/YYYY-MM/YYYYMMDD-HHmmss-<짧은설명>.md` (타임스탬프는 date 명령).\n"
-        "5. `docs/INDEX.md` `## 이력`에 한 줄 추가. 6. 생성 경로와 task_id/URL을 보고합니다."
+        "5. `docs/INDEX.md` `## 이력`에 한 줄 추가. 6. 생성 경로와 task_id/URL을 보고합니다.\n"
+        "※ 이 요청으로 (하위)태스크를 **함께 생성**하는 경우, 태스크 description은 평문 한 문단으로 넣지 말고 "
+        "`gdc_task_new`의 **라벨 섹션 템플릿(평문)**을 따릅니다: `[요약]` 한두 줄 → (선택·짝) `[AS-IS]`/`[TO-BE]` → "
+        "`[작업 내용]` 아래 `-` 블렛(각 한 줄). `create_task`가 이를 GDC 리치텍스트(HTML)로 변환합니다."
     )
 
 
