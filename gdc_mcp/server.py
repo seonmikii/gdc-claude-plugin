@@ -1566,13 +1566,13 @@ def gdc_sync(path: str = "") -> str:
         f"경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
         "이 커맨드는 **진행률·상태·실제 날짜 동기화 전용**입니다. "
         "본문(description)에 추가 작업/내용 변경을 반영하려면 `sync_doc_progress`의 `description`으로 통째 넘기지 말고"
-        "(본문 통째 교체는 인라인 이미지가 유실됨), `/gdc-reflect`(또는 `edit_task_description`)로 최소 편집하세요.\n"
+        "(본문 통째 교체는 인라인 이미지가 유실됨), `/gdc-apply`(또는 `edit_task_description`)로 최소 편집하세요.\n"
         "동기화 후 progress(%)와 상태 전이(진행/완료), 실제 시작/종료일을 보고하세요."
     )
 
 
 @mcp.prompt
-def gdc_reflect(path: str = "") -> str:
+def gdc_apply(path: str = "") -> str:
     """문서 변경을 연결된 태스크 본문/댓글/하위 태스크에 반영(분류→질문→라우팅)."""
     return (
         f"작업 요청 문서의 변경을 연결된 태스크에 반영합니다. 경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
