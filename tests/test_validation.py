@@ -13,6 +13,7 @@ from gdc_mcp.server import (
     _parse_date,
     _resolve_members,
     _resolve_mention_usernames,
+    _round_progress,
     _strip_meta_steps,
     _validate_dates,
 )
@@ -64,6 +65,43 @@ def test_actual_end_in_future_raises():
 
 def test_actual_end_in_past_ok():
     _validate_dates(actual_end="2000-01-01")  # 예외 없어야 함
+
+
+# ---------------------------------------------------------------------------
+# _round_progress — 전송 진행률 10% 단위 반올림 (GDC UI 10% 제약 회피)
+# ---------------------------------------------------------------------------
+
+def test_round_progress_multiples_of_10_unchanged():
+    for p in (0, 10, 20, 50, 90, 100):
+        assert _round_progress(p) == p
+
+
+def test_round_progress_banker_rounding_half_cases():
+    # Python round는 은행가 반올림(짝수 쪽) — 문서 확정 동작
+    assert _round_progress(5) == 0
+    assert _round_progress(15) == 20
+    assert _round_progress(25) == 20
+    assert _round_progress(35) == 40
+    assert _round_progress(45) == 40
+    assert _round_progress(85) == 80
+
+
+def test_round_progress_non_half_cases():
+    assert _round_progress(33) == 30
+    assert _round_progress(67) == 70
+    assert _round_progress(4) == 0
+    assert _round_progress(6) == 10
+
+
+def test_round_progress_high_boundary_caps_below_100():
+    # 95~99%가 100으로 올라가 조기 완료되는 것을 방지 → 최대 90
+    for p in (91, 94, 95, 96, 99):
+        assert _round_progress(p) == 90
+
+
+def test_round_progress_only_true_100_returns_100():
+    assert _round_progress(100) == 100
+    assert _round_progress(99) == 90
 
 
 # ---------------------------------------------------------------------------

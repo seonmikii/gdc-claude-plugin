@@ -788,11 +788,29 @@ def link_task_to_doc(doc_path: str, task_id: int) -> dict:
     }
 
 
+def _round_progress(raw: int) -> int:
+    """전송 진행률을 10% 단위로 반올림한다.
+
+    GDC UI는 태스크 진행률을 10% 단위로만 수정할 수 있어, 문서 진척으로 산출된
+    비(非)10단위 값(예: 33%)이 저장되면 이후 UI 수정 시 오류가 난다. 여기서 서버로
+    나가는 값을 항상 10단위로 맞춘다.
+
+    - `round(raw / 10) * 10` (Python 기본 은행가 반올림: 5로 끝나는 값은 짝수 쪽).
+    - 단 `raw >= 100`(모든 Phase 완료)일 때만 100을 반환하고, 그 미만은 최대 90으로
+      캡핑한다. `round(95/10)*10 == 100`이 95~99% 태스크를 조기 '완료' 전이시키는 것을 막기 위함.
+    """
+    if raw >= 100:
+        return 100
+    return min(round(raw / 10) * 10, 90)
+
+
 def _apply_progress_sync(task_id: int, new_progress: int, description: str | None = None) -> dict:
     """진행률을 PATCH하면서 상태/실제 날짜 전이를 함께 적용한다.
 
-    - 최초 진행(0 → 0 초과): 상태를 '진행'(in_progress, planned→만)으로, 실제 시작일을 오늘로(미설정 시).
-    - 100% 달성: 상태를 '완료'(done 계열)로, 실제 종료일을 오늘로(미설정 시).
+    - 전송 진행률은 `_round_progress`로 10% 단위 반올림한다(UI 수정 제약 회피).
+    - 상태/실제 날짜 전이는 반올림 전 raw 값 기준으로 판단한다(5% 미만 진척도 '진행'으로 전이).
+    - 최초 진행(0 → raw>0): 상태를 '진행'(in_progress, planned→만)으로, 실제 시작일을 오늘로(미설정 시).
+    - 100% 달성(raw>=100): 상태를 '완료'(done 계열)로, 실제 종료일을 오늘로(미설정 시).
     - description 전달 시: 같은 PATCH에 태스크 본문(description)도 함께 반영(명시 sync 전용; 훅은 미전달).
     프로젝트 상태 목록은 한 번만 조회해 재사용한다.
     """
@@ -811,20 +829,21 @@ def _apply_progress_sync(task_id: int, new_progress: int, description: str | Non
     old_progress = cur.get("progress") or 0
     cur_cat = cat_of.get(cur.get("status"))
     today = datetime.date.today().isoformat()
-    payload: dict = {"progress": new_progress}
+    raw = new_progress
+    payload: dict = {"progress": _round_progress(raw)}
     if description is not None:
         payload["description"] = normalize_description(description)  # 평문→HTML(이미 HTML이면 통과)
 
-    if old_progress == 0 and new_progress > 0 and not cur.get("actual_start_date"):
+    if old_progress == 0 and raw > 0 and not cur.get("actual_start_date"):
         payload["actual_start_date"] = today
 
-    if new_progress >= 100:
+    if raw >= 100:
         done = _pick("done", ("완료", "완료됨", "completed", "done", "closed", "종료"))
         if done and cur.get("status") != done:
             payload["status"] = done
         if not cur.get("actual_end_date"):
             payload["actual_end_date"] = today
-    elif new_progress > 0 and cur_cat not in ("in_progress", "done"):
+    elif raw > 0 and cur_cat not in ("in_progress", "done"):
         ip = _pick("in_progress", ("inprogress", "진행", "진행중"))
         if ip:
             payload["status"] = ip
@@ -1362,7 +1381,7 @@ def _cli_sync_doc(doc_path: str) -> None:
     try:
         result = compute_phase_progress(text)
         t = _apply_progress_sync(int(task_id), result["progress"])
-        print(f"synced task {task_id}: progress={result['progress']}% status={t.get('status')}")
+        print(f"synced task {task_id}: progress={t.get('progress')}% status={t.get('status')}")
     except NotAuthenticatedError:
         return  # 미인증 → 조용히 종료
     except Exception:
