@@ -21,12 +21,15 @@ from . import tokens
 from .client import GdcClient, NotAuthenticatedError
 from .handoff import browser_handoff, open_in_chrome
 from .doc_utils import (
+    append_work_bullets,
     compute_phase_progress,
     extract_title,
     html_to_text,
+    label_section_has_media,
     normalize_description,
     read_frontmatter,
     read_metadata_table,
+    replace_label_section,
     upsert_frontmatter,
 )
 
@@ -760,6 +763,77 @@ async def update_task(
 
 
 @mcp.tool
+async def edit_task_description(
+    ctx: Context,
+    task_id: int | str,
+    mode: str,
+    bullets: list[str] | None = None,
+    label: str = "작업 내용",
+    new_body_html: str | None = None,
+    keep_media: bool = True,
+) -> dict:
+    """태스크 본문(description)을 통째 덮어쓰지 않고 최소 편집한다(인라인 이미지 보존).
+
+    본문을 재구성해 통째로 PATCH하면 `<img data-attachment-id>` 인라인 이미지가 유실된다.
+    이 도구는 현재 본문 HTML을 받아 필요한 부분만 편집해 PATCH하므로 편집 대상 밖 이미지가
+    자동 보존된다. 반영(문서→태스크) 흐름에서 **추가 작업/내용 변경**을 본문에 적용할 때 쓴다.
+
+    mode:
+    - "append_work": `[label]`(기본 '작업 내용') 섹션 목록에 bullets를 `<li>`로 추가한다
+      (섹션/목록이 없으면 신설). 기존 내용·이미지 100% 보존. bullets 필수.
+    - "replace_section": `[label]` 섹션 **본문만** new_body_html로 교체한다(라벨 문단·타 섹션 보존).
+      섹션에 인라인 이미지가 있으면 keep_media=True(기본)는 이미지를 섹션 끝으로 옮겨 보존,
+      keep_media=False는 함께 삭제. new_body_html 필수(라벨 문단 제외한 본문 HTML).
+
+    task_id는 id(정수) 또는 제목(문자열). 편집 결과가 현재와 같으면 PATCH하지 않고 그대로 반환.
+    """
+    resolved_id = await _resolve_task(ctx, task_id)
+    cur = client.get(f"{_TASKS}{resolved_id}/").json()
+    current_html = cur.get("description") or ""
+    media_warning = None
+
+    if mode == "append_work":
+        if not bullets or not [b for b in bullets if b and b.strip()]:
+            raise ValueError("append_work 모드는 추가할 bullets가 필요합니다.")
+        new_html = append_work_bullets(current_html, bullets, label=label)
+    elif mode == "replace_section":
+        if not new_body_html:
+            raise ValueError("replace_section 모드는 new_body_html이 필요합니다.")
+        if keep_media and label_section_has_media(current_html, label):
+            media_warning = (
+                f"'[{label}]' 섹션의 인라인 이미지를 섹션 끝으로 옮겨 보존했습니다"
+                "(문단 위치가 섹션 하단으로 이동). 삭제하려면 keep_media=False로 다시 호출하세요."
+            )
+        new_html = replace_label_section(
+            current_html, label, new_body_html, keep_media=keep_media
+        )
+    else:
+        raise ValueError("mode는 'append_work' 또는 'replace_section'이어야 합니다.")
+
+    if new_html == current_html:
+        return {
+            "id": resolved_id,
+            "changed": False,
+            "url": _task_url(resolved_id),
+            "note": "변경 사항이 없어 PATCH하지 않았습니다.",
+        }
+
+    t = client.request(
+        "PATCH", f"{_TASKS}{resolved_id}/", json={"description": new_html}
+    ).json()
+    result = {
+        "id": t["id"],
+        "changed": True,
+        "mode": mode,
+        "title": t.get("title"),
+        "url": _task_url(t["id"]),
+    }
+    if media_warning:
+        result["media_warning"] = media_warning
+    return result
+
+
+@mcp.tool
 def open_task(task_id: int) -> dict:
     """태스크 웹 화면을 Chrome 새 탭으로 연다.
 
@@ -1490,9 +1564,33 @@ def gdc_sync(path: str = "") -> str:
     return (
         f"`sync_doc_progress` 도구로 문서의 진행률을 연결된 태스크에 동기화하세요. "
         f"경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
-        "문서 본문(요청 내용/작업 결과 단계)이 수정됐다면, '[작업 내용]' 요약(첫 줄 요청 요약 + 단계별 블렛, 체크박스 없이)을 "
-        "재생성해 `sync_doc_progress`의 `description` 인자로 함께 넘겨 태스크 본문도 갱신하세요(진행률만 맞출 때는 생략).\n"
+        "이 커맨드는 **진행률·상태·실제 날짜 동기화 전용**입니다. "
+        "본문(description)에 추가 작업/내용 변경을 반영하려면 `sync_doc_progress`의 `description`으로 통째 넘기지 말고"
+        "(본문 통째 교체는 인라인 이미지가 유실됨), `/gdc-reflect`(또는 `edit_task_description`)로 최소 편집하세요.\n"
         "동기화 후 progress(%)와 상태 전이(진행/완료), 실제 시작/종료일을 보고하세요."
+    )
+
+
+@mcp.prompt
+def gdc_reflect(path: str = "") -> str:
+    """문서 변경을 연결된 태스크 본문/댓글/하위 태스크에 반영(분류→질문→라우팅)."""
+    return (
+        f"작업 요청 문서의 변경을 연결된 태스크에 반영합니다. 경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
+        "본문은 통째로 덮어쓰지 않습니다(인라인 이미지 유실 방지) — 아래 절차로 최소 편집/댓글/하위 태스크로 라우팅하세요.\n"
+        "1. 문서 frontmatter의 task_id 확인(없으면 link_task_to_doc/gdc_login 안내). `get_task`로 현재 본문(description)을 가져옵니다.\n"
+        "2. 문서(요청 내용/`## 작업 결과`)와 현재 본문을 비교해 **추가 작업**인지 **기존 내용 변경**인지 분류합니다.\n"
+        "3. **추가 작업**이면 AskUserQuestion으로 반영 위치를 묻습니다:\n"
+        "   ① 본문 append — `edit_task_description(task_id, mode='append_work', bullets=[...])`로 `[작업 내용]`에 블렛 추가.\n"
+        "   ② 댓글 — `add_task_comment`에 `[추가 (YYYY-MM-DD)]` 라벨 + 블렛.\n"
+        "   ③ 하위 태스크 — `create_task(parent=task_id, ...)`.\n"
+        "4. **내용 변경**이면 AskUserQuestion으로 묻습니다:\n"
+        "   ① 본문만 최신화 — `edit_task_description(task_id, mode='replace_section', label='<라벨>', new_body_html='<본문HTML>')`로 해당 라벨 섹션만 교체.\n"
+        "   ② 댓글만 — `add_task_comment`에 `[변경 (YYYY-MM-DD)]` + 변경 이유 + 전/후(본문 유지).\n"
+        "   ③ 둘 다 — 본문 교체 + 변경이력 댓글.\n"
+        "   변경 이유는 문서 diff·맥락에서 초안을 만들고 사용자가 수정하게 합니다.\n"
+        "5. replace_section 대상 섹션에 인라인 이미지가 있으면 도구가 경고합니다 — 유지(기본)/삭제를 사용자에게 확인하고 keep_media로 반영하세요.\n"
+        "6. new_body_html은 GDC 리치텍스트 형식(`<p>...</p>`, `<ul><li><p>...</p></li></ul>`)으로 작성합니다(라벨 문단 `<p><strong>라벨</strong></p>`은 도구가 유지).\n"
+        "7. 반영 결과(모드·대상·URL, 이미지 경고 있으면 함께)를 보고합니다. 진행률·상태·날짜 동기화는 `/gdc-sync`가 담당합니다."
     )
 
 

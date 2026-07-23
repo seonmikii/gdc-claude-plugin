@@ -128,6 +128,107 @@ def html_to_text(content: str | None) -> str:
     return _MULTI_BLANK_RE.sub("\n\n", text).strip()
 
 
+# ── 태스크 description(HTML) 최소 편집 ─────────────────────────────────────────
+# GDC 리치텍스트는 라벨을 `<p><strong>라벨</strong></p>` 단독 문단으로 저장한다(실증: 태스크
+# #15428 라운드트립 — 생성 형식을 그대로 반환, <strong> 유지). 이 경계로 섹션을 나눠 append/부분
+# 교체만 수행하면 편집 대상 밖 `<img data-attachment-id>`가 자동 보존된다(본문 통째 재구성 금지 —
+# 인라인 이미지 유실 방지). 문단 전체가 <strong>일 때만 라벨(문장 속 인라인 <strong>은 제외).
+_LABEL_BLOCK_RE = re.compile(r"<p><strong>([^<]*)</strong></p>")
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_UL_RE = re.compile(r"(?s)<ul>.*?</ul>")  # 개별 <ul>...</ul> (비탐욕)
+
+
+def split_label_sections(html_content: str) -> list[dict[str, str | None]]:
+    """description HTML을 라벨 섹션 단위로 분해한다(최소 편집용).
+
+    라벨(`<p><strong>라벨</strong></p>`) 문단을 경계로 각 섹션을 `{label, html}`로 반환한다.
+    첫 라벨 앞 내용(프리앰블)은 label=None 섹션이 된다. 반환 섹션의 html을 순서대로 이으면
+    원본과 동일하다(무손실). 문장 속 인라인 `<strong>`은 문단 전체가 아니므로 라벨로 오인하지 않는다.
+    """
+    html_content = html_content or ""
+    matches = list(_LABEL_BLOCK_RE.finditer(html_content))
+    if not matches:
+        return [{"label": None, "html": html_content}] if html_content else []
+    sections: list[dict[str, str | None]] = []
+    if matches[0].start() > 0:
+        sections.append({"label": None, "html": html_content[: matches[0].start()]})
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(html_content)
+        sections.append({"label": m.group(1), "html": html_content[m.start() : end]})
+    return sections
+
+
+def _label_matches(stored: str | None, label: str) -> bool:
+    """저장된 라벨 텍스트와 호출자 평문 라벨을 비교(엔티티 이스케이프 차이 흡수)."""
+    return stored is not None and stored in (label, html.escape(label, quote=False))
+
+
+def append_work_bullets(html_content: str, bullets: list[str], label: str = "작업 내용") -> str:
+    """`[label]` 섹션 목록에 블릿(`<li>`)을 추가한다(통째 덮어쓰기 아님).
+
+    - label 섹션에 `<ul>`이 있으면 마지막 `<ul>` 끝에 `<li><p>...</p></li>`를 덧붙인다.
+    - label 섹션은 있으나 `<ul>`이 없으면 섹션 끝에 새 `<ul>`을 만든다.
+    - label 섹션이 없으면 문서 끝에 `<p><strong>label</strong></p><ul>...</ul>`를 신설한다
+      (기존 내용이 있으면 `<p></p>` 구분 문단을 먼저 둔다).
+    편집 대상 밖 내용/이미지는 건드리지 않는다. 블릿 텍스트는 GDC 생성 형식과 동일하게 이스케이프한다.
+    """
+    bullets = [b for b in (bullets or []) if b and b.strip()]
+    if not bullets:
+        return html_content
+    new_lis = "".join(
+        f"<li><p>{html.escape(b.strip(), quote=False)}</p></li>" for b in bullets
+    )
+    sections = split_label_sections(html_content)
+    for sec in sections:
+        if _label_matches(sec["label"], label):
+            body = sec["html"] or ""
+            uls = list(_UL_RE.finditer(body))
+            if uls:
+                insert_at = uls[-1].end() - len("</ul>")
+                sec["html"] = body[:insert_at] + new_lis + body[insert_at:]
+            else:
+                sec["html"] = body + f"<ul>{new_lis}</ul>"
+            return "".join(s["html"] for s in sections)
+    block = f"<p><strong>{html.escape(label, quote=False)}</strong></p><ul>{new_lis}</ul>"
+    if not (html_content or "").strip():
+        return block
+    return html_content + "<p></p>" + block
+
+
+def label_section_has_media(html_content: str, label: str) -> bool:
+    """`[label]` 섹션 본문에 인라인 이미지(`<img>`)가 있는지 검사(교체 전 경고 판단용)."""
+    for sec in split_label_sections(html_content):
+        if _label_matches(sec["label"], label):
+            return bool(_IMG_TAG_RE.search(sec["html"] or ""))
+    return False
+
+
+def replace_label_section(
+    html_content: str, label: str, new_body_html: str, keep_media: bool = True
+) -> str:
+    """`[label]` 섹션의 본문만 `new_body_html`로 교체한다(라벨 문단·타 섹션 보존).
+
+    - label 섹션을 찾지 못하면 ValueError.
+    - 섹션 본문에 `<img>`가 있고 keep_media=True면 `<img>` 태그를 추출해 새 본문 뒤(섹션 끝)에
+      `<p><img...></p>`로 재삽입한다(같은 섹션 내 유지 보장, 문단 위치는 섹션 하단으로 이동).
+      keep_media=False면 `<img>`를 함께 제거한다.
+    라벨 문단은 저장 원본 그대로 보존한다. new_body_html은 라벨 문단을 제외한 본문 HTML
+    (예: `<ul>...</ul>`, `<p>...</p>`)이어야 한다.
+    """
+    sections = split_label_sections(html_content)
+    for sec in sections:
+        if _label_matches(sec["label"], label):
+            marker = f"<p><strong>{sec['label']}</strong></p>"
+            body_after = sec["html"][len(marker) :] if sec["html"].startswith(marker) else ""
+            preserved = ""
+            if keep_media:
+                imgs = _IMG_TAG_RE.findall(body_after)
+                preserved = "".join(f"<p>{tag}</p>" for tag in imgs)
+            sec["html"] = marker + (new_body_html or "") + preserved
+            return "".join(s["html"] for s in sections)
+    raise ValueError(f"라벨 섹션 '[{label}]'을(를) 찾을 수 없습니다.")
+
+
 def read_frontmatter(text: str) -> dict[str, str]:
     m = _FRONTMATTER_RE.match(text)
     if not m:
