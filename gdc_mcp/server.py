@@ -262,6 +262,30 @@ def _not_finished_names(project_id: int) -> list[str]:
     return [s["name"] for s in p.get("task_statuses", []) if s.get("category") != "done"]
 
 
+def _task_summary(t: dict) -> dict:
+    """태스크(목록/하위/연관 항목)를 표시용 요약 dict로 압축한다.
+
+    list_tasks·get_task의 하위/연관 태스크 등 여러 곳에서 동일한 요약 형태를 재사용한다.
+    입력은 TaskListSerializer 계열 필드(id·number·title·project*·status·priority·progress
+    ·planned_end_date·assignee_name)를 가진 dict를 가정한다.
+    """
+    return {
+        "id": t["id"],
+        "number": t.get("number"),
+        "title": t.get("title"),
+        "project_name": t.get("project_name"),
+        "project": t.get("project"),
+        "status": t.get("status"),
+        "status_label": _STATUS_LABELS.get(t.get("status"), t.get("status")),
+        "priority": t.get("priority"),
+        "priority_label": _PRIORITY_LABELS.get(t.get("priority"), t.get("priority")),
+        "progress": t.get("progress"),
+        "planned_end_date": t.get("planned_end_date"),
+        "assignee_name": t.get("assignee_name"),
+        "url": _task_url(t["id"]),
+    }
+
+
 def _finalize_task_list(results: list[dict], overdue: bool, undated: bool, limit: int) -> dict:
     """태스크 목록에 overdue/undated 클라이언트 필터를 적용하고 표시용 형태로 정리한다."""
     if overdue:
@@ -272,24 +296,7 @@ def _finalize_task_list(results: list[dict], overdue: bool, undated: bool, limit
     results = results[:limit]
     return {
         "count": len(results),
-        "tasks": [
-            {
-                "id": t["id"],
-                "number": t.get("number"),
-                "title": t.get("title"),
-                "project_name": t.get("project_name"),
-                "project": t.get("project"),
-                "status": t.get("status"),
-                "status_label": _STATUS_LABELS.get(t.get("status"), t.get("status")),
-                "priority": t.get("priority"),
-                "priority_label": _PRIORITY_LABELS.get(t.get("priority"), t.get("priority")),
-                "progress": t.get("progress"),
-                "planned_end_date": t.get("planned_end_date"),
-                "assignee_name": t.get("assignee_name"),
-                "url": _task_url(t["id"]),
-            }
-            for t in results
-        ],
+        "tasks": [_task_summary(t) for t in results],
     }
 
 
@@ -486,6 +493,50 @@ def _resolve_customer(workspace_id: int | None, customer: int | str) -> int:
     raise ValueError(
         f"고객사 '{name}'을(를) 찾을 수 없습니다(미존재 또는 열람 권한 없음). "
         f"고객사 id로 직접 지정할 수 있습니다."
+    )
+
+
+async def _resolve_task(ctx: Context | None, id_or_title: int | str) -> int:
+    """태스크 식별자(id 또는 제목)를 태스크 id로 해석한다.
+
+    - 정수 또는 정수 문자열 → 그대로 태스크 id.
+    - 그 외 문자열 → 현재 레포 프로젝트에서 search로 조회. 제목 정확 일치(대소문자 무시)가
+      1건이면 채택, 그 외 다수면 후보 목록으로 안내(ValueError), 0건이면 오류(ValueError).
+    제목 검색 범위는 현재 프로젝트로 한정한다(멤버/고객사 해석과 동일 UX).
+    """
+    if not isinstance(id_or_title, bool) and (
+        isinstance(id_or_title, int) or str(id_or_title).strip().isdigit()
+    ):
+        return int(id_or_title)
+    title = str(id_or_title).strip()
+    if not title:
+        raise ValueError("조회할 태스크의 id 또는 제목을 입력하세요.")
+    project_id = (await _resolve_context(ctx)).get("project_id")
+    if project_id is None:
+        raise ValueError(
+            "프로젝트가 설정되지 않았습니다. 제목으로 조회하려면 "
+            "gdc_login 또는 set_context로 프로젝트를 선택하세요."
+        )
+    results = (
+        client.get(_TASKS, params={"project": project_id, "search": title, "page_size": 20})
+        .json()
+        .get("results", [])
+    )
+    if not results:
+        raise ValueError(
+            f"제목 '{title}'에 해당하는 태스크를 현재 프로젝트에서 찾을 수 없습니다. "
+            f"제목을 확인하거나 태스크 id로 지정하세요."
+        )
+    exact = [r for r in results if str(r.get("title", "")).strip().lower() == title.lower()]
+    candidates = exact or results
+    if len(candidates) == 1:
+        return candidates[0]["id"]
+    listing = ", ".join(
+        f"#{r.get('number')} {r.get('title')}({_task_url(r['id'])})" for r in candidates[:10]
+    )
+    raise ValueError(
+        f"제목 '{title}'이(가) 하나로 특정되지 않습니다. 후보: {listing} "
+        f"— 제목을 더 정확히 쓰거나 태스크 id로 지정하세요."
     )
 
 
@@ -737,13 +788,75 @@ def _status_category(
     return None
 
 
+def _parent_summary(t: dict) -> dict | None:
+    """상세 응답의 ancestors(최상위→직속 순)에서 직속 상위 태스크 요약을 만든다.
+
+    ancestors는 상세 API가 이미 반환하므로 추가 왕복이 없다. 상위가 없으면 None.
+    """
+    ancestors = t.get("ancestors") or []
+    if not ancestors:
+        return None
+    p = ancestors[-1]  # 직속 상위(경로 마지막)
+    return {
+        "id": p.get("id"),
+        "number": p.get("number"),
+        "title": p.get("title"),
+        "url": _task_url(p["id"]) if p.get("id") else None,
+    }
+
+
+def _related_tasks(t: dict) -> list[dict]:
+    """outgoing/incoming 링크를 방향 유지로 통합한 연관 태스크 목록.
+
+    각 항목은 {direction, link_type, task}. direction은 이 태스크 기준:
+    - outgoing: 이 태스크 → 대상(target). `blocks`면 "대상을 차단함".
+    - incoming: 원본(source) → 이 태스크. `blocks`면 "원본에게 차단됨".
+    link_type(related/blocks/…)은 조회 주체에 따라 의미가 반대이므로 방향과 함께 그대로 노출한다.
+    """
+    related: list[dict] = []
+    for link in t.get("outgoing_links", []) or []:
+        tid = link.get("target_task")
+        related.append({
+            "direction": "outgoing",
+            "link_type": link.get("link_type"),
+            "task": {
+                "id": tid,
+                "number": link.get("target_task_number"),
+                "title": link.get("target_task_title"),
+                "url": _task_url(tid) if tid else None,
+            },
+        })
+    for link in t.get("incoming_links", []) or []:
+        sid = link.get("source_task")
+        related.append({
+            "direction": "incoming",
+            "link_type": link.get("link_type"),
+            "task": {
+                "id": sid,
+                "number": link.get("source_task_number"),
+                "title": link.get("source_task_title"),
+                "url": _task_url(sid) if sid else None,
+            },
+        })
+    return related
+
+
 @mcp.tool
-def get_task(task_id: int) -> dict:
+async def get_task(ctx: Context, task_id: int | str) -> dict:
     """태스크 상세를 조회한다(작업 요청 문서 생성·연동용).
 
-    제목/내용/상태/우선순위/유형/날짜/진행률/담당자 등 문서 작성에 필요한 필드를 반환한다.
+    task_id는 태스크 id(정수) **또는 제목(문자열)** — 제목이면 현재 프로젝트에서 검색해
+    해석한다(정확 1건이면 채택, 다수면 후보 안내, 0건이면 오류).
+
+    제목/내용/상태/우선순위/유형/날짜/진행률/담당자 등 문서 작성에 필요한 필드와 함께
+    **상위 태스크(parent)·하위 태스크(sub_tasks)·연관 태스크(related_tasks)** 를 반환한다.
+    - sub_tasks: 이 태스크의 하위 태스크 요약 목록(휴지통 제외, 서버 가시성 필터 적용).
+    - related_tasks: outgoing/incoming 링크를 방향 유지로 통합({direction, link_type, task}).
+    - parent: 직속 상위 태스크 요약(없으면 null).
+    상세 API 1회 호출로 모두 받으므로 추가 왕복이 없다(제목 해석 시 검색 1회 추가).
     """
-    t = client.get(f"{_TASKS}{task_id}/").json()
+    resolved_id = await _resolve_task(ctx, task_id)
+    t = client.get(f"{_TASKS}{resolved_id}/").json()
     return {
         "id": t["id"],
         "number": t.get("number"),
@@ -763,6 +876,9 @@ def get_task(task_id: int) -> dict:
         "planned_end_date": t.get("planned_end_date"),
         "assignee_name": t.get("assignee_name"),
         "url": _task_url(t["id"]),
+        "parent": _parent_summary(t),
+        "sub_tasks": [_task_summary(s) for s in (t.get("sub_tasks") or [])],
+        "related_tasks": _related_tasks(t),
     }
 
 
@@ -1240,6 +1356,21 @@ def gdc_switch() -> str:
         "2. 고른 워크스페이스로 `list_projects(workspace_id)`를 호출해 프로젝트를 선택 질문으로 고릅니다(동일 규칙).\n"
         "3. `set_context(workspace_id, project_id)`로 현재 레포 컨텍스트를 갱신합니다.\n"
         "4. 전환된 워크스페이스/프로젝트(이름)와 적용 레포(root)를 보고합니다."
+    )
+
+
+@mcp.prompt
+def gdc_task(task: str = "") -> str:
+    """태스크 상세 조회 (id 또는 제목, 하위·연관·상위 태스크 포함)."""
+    return (
+        f"`get_task` 도구로 태스크 상세를 조회하세요. 대상: {task or '(필수: 태스크 id 또는 제목)'}\n"
+        "- 인자는 태스크 id(정수) 또는 제목(문자열). 제목이면 도구가 현재 프로젝트에서 검색해 해석합니다"
+        "(정확 1건이면 채택, 다수면 후보 안내, 0건이면 오류).\n"
+        "- 상태·우선순위·유형은 응답의 `status_label`·`priority_label`·`task_type_label`(한글), 프로젝트는 `project_name`을 씁니다.\n"
+        "- 상위(parent)는 있으면 번호·제목·URL 한 줄로, 하위(sub_tasks)는 번호/제목/상태/진행률/URL 표로 보여줍니다.\n"
+        "- 연관(related_tasks)은 각 항목의 `direction`(outgoing=대상으로, incoming=원본에서)·`link_type`과 대상/원본 "
+        "번호·제목·URL을 함께 표기합니다. `blocks`/`blocked_by`는 방향에 따라 의미가 반대이므로 방향을 명시합니다.\n"
+        "조회 프로젝트는 현재 레포 컨텍스트로 고정됩니다. 특정 태스크를 열어달라고 하면 `open_task(task_id)`로 Chrome 새 탭에 엽니다."
     )
 
 
