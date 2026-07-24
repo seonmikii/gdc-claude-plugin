@@ -499,13 +499,17 @@ def _resolve_customer(workspace_id: int | None, customer: int | str) -> int:
     )
 
 
-async def _resolve_task(ctx: Context | None, id_or_title: int | str) -> int:
+async def _resolve_task(
+    ctx: Context | None, id_or_title: int | str, show_archived: bool = False
+) -> int:
     """태스크 식별자(id 또는 제목)를 태스크 id로 해석한다.
 
     - 정수 또는 정수 문자열 → 그대로 태스크 id.
     - 그 외 문자열 → 현재 레포 프로젝트에서 search로 조회. 제목 정확 일치(대소문자 무시)가
       1건이면 채택, 그 외 다수면 후보 목록으로 안내(ValueError), 0건이면 오류(ValueError).
     제목 검색 범위는 현재 프로젝트로 한정한다(멤버/고객사 해석과 동일 UX).
+    show_archived=True면 숨긴 태스크도 검색 대상에 포함한다(숨김 해제·삭제 대상 해석용) —
+    list는 기본적으로 숨긴 태스크를 제외하므로, 숨긴 태스크를 제목으로 지정하려면 필요하다.
     """
     if not isinstance(id_or_title, bool) and (
         isinstance(id_or_title, int) or str(id_or_title).strip().isdigit()
@@ -520,11 +524,10 @@ async def _resolve_task(ctx: Context | None, id_or_title: int | str) -> int:
             "프로젝트가 설정되지 않았습니다. 제목으로 조회하려면 "
             "gdc_login 또는 set_context로 프로젝트를 선택하세요."
         )
-    results = (
-        client.get(_TASKS, params={"project": project_id, "search": title, "page_size": 20})
-        .json()
-        .get("results", [])
-    )
+    params: dict[str, str | int] = {"project": project_id, "search": title, "page_size": 20}
+    if show_archived:
+        params["show_archived"] = "true"
+    results = client.get(_TASKS, params=params).json().get("results", [])
     if not results:
         raise ValueError(
             f"제목 '{title}'에 해당하는 태스크를 현재 프로젝트에서 찾을 수 없습니다. "
@@ -1400,6 +1403,238 @@ def delete_task_comment(comment_id: int) -> dict:
             raise ValueError("본인이 작성한 댓글만 삭제할 수 있습니다.") from e
         raise
     return {"deleted": True, "comment_id": comment_id}
+
+
+# --- 태스크 숨기기·삭제·복구 ----------------------------------------------------
+# 서버가 토큰 권한으로 강제하므로(403), 도구는 권한 판정 없이 실행하고 403을 한글로 변환한다.
+# 파괴적/부작용 동작(숨기기·삭제·복구)은 confirm 게이트: confirm=False면 미리보기만 반환한다.
+
+
+async def _trashed_items(ctx: Context) -> tuple[int, list[dict], int]:
+    """현재 프로젝트 휴지통(soft-deleted) 목록을 조회한다. (project_id, items, total) 반환.
+
+    trash는 자동으로 현재 프로젝트로 스코프되지 않으므로 project를 명시 전송한다(미전송 시
+    관리 권한 있는 전 프로젝트 휴지통이 섞임). 삭제 태스크는 일반 search에서 빠지므로 제목
+    해석·복구 대상 확인에 이 목록을 쓴다.
+    """
+    project_id = (await _resolve_context(ctx)).get("project_id")
+    if project_id is None:
+        raise ValueError(
+            "프로젝트가 설정되지 않았습니다. gdc_login 또는 set_context로 프로젝트를 선택하세요."
+        )
+    data = client.get(f"{_TASKS}trash/", params={"project": project_id, "page_size": 100}).json()
+    if isinstance(data, dict):
+        return project_id, data.get("results", []), data.get("count", 0)
+    return project_id, data, len(data)
+
+
+def _find_trashed(items: list[dict], id_or_title: int | str) -> tuple[int, dict | None]:
+    """휴지통 항목에서 id 또는 제목으로 대상을 찾아 (id, item) 반환. 모호/부재면 ValueError.
+
+    id는 목록에 없어도 그대로 통과시킨다(다른 프로젝트 소속 등 — 서버가 최종 판정).
+    """
+    if not isinstance(id_or_title, bool) and (
+        isinstance(id_or_title, int) or str(id_or_title).strip().isdigit()
+    ):
+        tid = int(id_or_title)
+        return tid, next((r for r in items if r.get("id") == tid), None)
+    title = str(id_or_title).strip()
+    if not title:
+        raise ValueError("복구할 태스크의 id 또는 제목을 입력하세요.")
+    exact = [r for r in items if str(r.get("title", "")).strip().lower() == title.lower()]
+    candidates = exact or [
+        r for r in items if title.lower() in str(r.get("title", "")).strip().lower()
+    ]
+    if len(candidates) == 1:
+        return candidates[0]["id"], candidates[0]
+    if not candidates:
+        raise ValueError(
+            f"제목 '{title}'에 해당하는 삭제된 태스크를 현재 프로젝트 휴지통에서 찾을 수 없습니다. "
+            f"list_trashed_tasks로 확인하거나 태스크 id로 지정하세요."
+        )
+    listing = ", ".join(f"#{r.get('number')} {r.get('title')}(id={r['id']})" for r in candidates[:10])
+    raise ValueError(
+        f"제목 '{title}'이(가) 하나로 특정되지 않습니다. 후보: {listing} — 태스크 id로 지정하세요."
+    )
+
+
+@mcp.tool
+async def archive_task(
+    ctx: Context, task_id: int | str, archived: bool = True, confirm: bool = False
+) -> dict:
+    """태스크를 숨기거나(archived=True) 숨김 해제한다(archived=False). 토글 API를 멱등 래핑한다.
+
+    task_id는 태스크 id(정수) **또는 제목(문자열)** — 제목이면 현재 프로젝트에서 검색해 해석한다.
+    숨기면 **모든 하위 태스크가 함께 숨김**되고 고정(pin)은 자동 해제된다. WBS 프로젝트는 숨김
+    기능을 지원하지 않는다(안내). 숨김 해제는 상위가 숨김 상태면 막힌다(먼저 상위 숨김 해제).
+
+    **확인 게이트**: confirm=False(기본)면 대상과 현재/목표 상태만 미리보기로 반환하고 실행하지
+    않는다. confirm=True로 다시 호출해야 실제로 토글한다. 이미 원하는 상태면 호출 없이 그대로 둔다(멱등).
+    """
+    # 숨김 해제 대상은 이미 숨겨져 list에서 빠지므로 제목 해석에 숨긴 태스크도 포함한다.
+    resolved_id = await _resolve_task(ctx, task_id, show_archived=True)
+    t = client.get(f"{_TASKS}{resolved_id}/").json()
+    current = bool(t.get("is_archived"))
+    target = bool(archived)
+    action = "숨기기" if target else "숨김 해제"
+    info = {
+        "id": t["id"],
+        "number": t.get("number"),
+        "title": t.get("title"),
+        "current_archived": current,
+        "target_archived": target,
+        "action": action,
+        "sub_task_count": len(t.get("sub_tasks") or []),
+        "url": _task_url(t["id"]),
+    }
+    if current == target:
+        return {"changed": False, "reason": f"이미 {action} 상태입니다.", **info}
+    if not confirm:
+        return {
+            "confirm_required": True,
+            "message": (
+                f"#{t.get('number')} '{t.get('title')}'을(를) {action}합니다. "
+                f"하위 태스크도 함께 처리됩니다. confirm=true로 다시 호출하세요."
+            ),
+            **info,
+        }
+    try:
+        client.request("POST", f"{_TASKS}{resolved_id}/archive/")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            raise ValueError("태스크 숨기기 권한이 없습니다.") from e
+        if e.response.status_code == 400:
+            code = (e.response.json() or {}).get("code")
+            if code == "wbs_archive_disabled":
+                raise ValueError("WBS 프로젝트에서는 숨김 기능을 지원하지 않습니다.") from e
+            if code == "parent_archived":
+                raise ValueError(
+                    "상위 태스크가 숨김 상태입니다. 최상위 태스크의 숨김을 먼저 해제하세요."
+                ) from e
+        raise
+    return {"changed": True, **info}
+
+
+@mcp.tool
+async def delete_task(ctx: Context, task_id: int | str, confirm: bool = False) -> dict:
+    """태스크를 삭제한다(**소프트 삭제 → 휴지통 이동, 복구 가능**). 관리자 이상 권한 필요.
+
+    task_id는 태스크 id(정수) **또는 제목(문자열)** — 제목이면 현재 프로젝트에서 검색해 해석한다.
+    하위 태스크 처리: **WBS 프로젝트는 하위 전체 연쇄 삭제**, 비WBS는 직속 하위를 최상위로 승격
+    후 본체만 삭제한다(손자는 승격된 부모 밑 유지). 복구는 restore_task, 목록은 list_trashed_tasks.
+
+    **확인 게이트**: confirm=False(기본)면 삭제 대상과 하위 영향만 미리보기로 반환하고 삭제하지
+    않는다. confirm=True로 다시 호출해야 실제 삭제한다.
+    """
+    # 숨긴 태스크도 삭제 대상이 될 수 있으므로 제목 해석에 포함한다.
+    resolved_id = await _resolve_task(ctx, task_id, show_archived=True)
+    t = client.get(f"{_TASKS}{resolved_id}/").json()
+    sub_count = len(t.get("sub_tasks") or [])
+    info = {
+        "id": t["id"],
+        "number": t.get("number"),
+        "title": t.get("title"),
+        "sub_task_count": sub_count,
+        "url": _task_url(t["id"]),
+    }
+    if not confirm:
+        return {
+            "confirm_required": True,
+            "message": (
+                f"#{t.get('number')} '{t.get('title')}'을(를) 삭제(휴지통 이동)합니다. "
+                f"하위 {sub_count}개는 프로젝트 유형에 따라 연쇄 삭제(WBS) 또는 최상위 승격(비WBS)됩니다. "
+                f"복구 가능. confirm=true로 다시 호출하세요."
+            ),
+            **info,
+        }
+    try:
+        client.request("DELETE", f"{_TASKS}{resolved_id}/")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            raise ValueError("태스크 삭제 권한이 없습니다 (관리자 이상).") from e
+        raise
+    return {"deleted": True, **info}
+
+
+@mcp.tool
+async def restore_task(ctx: Context, task_id: int | str, confirm: bool = False) -> dict:
+    """휴지통의 삭제된 태스크를 복구한다. 관리자 이상 권한 필요.
+
+    task_id는 태스크 id(정수) **또는 제목(문자열)** — 삭제 태스크는 일반 검색에서 빠지므로
+    **현재 프로젝트 휴지통에서 제목을 매칭**한다. 존재하지 않거나 삭제되지 않은 태스크는 안내한다.
+
+    **주의**: 첨부 파일은 함께 복구되지만 **연쇄 삭제된 하위 태스크는 복구되지 않고 휴지통에 남는다**
+    (단건 + 자기 첨부만 복구). **WBS 태스크는 원래 부모 밑이 아니라 최상위로 분리되고 비중(weight)이
+    해제된 상태로 복구**된다.
+
+    **확인 게이트**: confirm=False(기본)면 대상·부작용만 미리보기로 반환하고 복구하지 않는다.
+    confirm=True로 다시 호출해야 실제 복구한다.
+    """
+    _, items, _ = await _trashed_items(ctx)
+    resolved_id, item = _find_trashed(items, task_id)
+    if not confirm:
+        info: dict = {"id": resolved_id}
+        if item:
+            info.update({
+                "number": item.get("number"),
+                "title": item.get("title"),
+                "deleted_at": item.get("deleted_at"),
+                "deleted_by": item.get("deleted_by_name"),
+            })
+        return {
+            "confirm_required": True,
+            "message": (
+                "이 태스크를 복구합니다. 첨부는 함께 복구되지만 연쇄 삭제된 하위는 복구되지 않으며, "
+                "WBS면 최상위로 분리(weight 해제)됩니다. confirm=true로 다시 호출하세요."
+            ),
+            **info,
+        }
+    try:
+        t = client.request("POST", f"{_TASKS}{resolved_id}/restore/").json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            raise ValueError("태스크 복구 권한이 없습니다 (관리자 이상).") from e
+        if e.response.status_code == 404:
+            raise ValueError(
+                "복구할 태스크를 찾을 수 없습니다(삭제되지 않았거나 존재하지 않음)."
+            ) from e
+        raise
+    return {
+        "restored": True,
+        "id": t.get("id"),
+        "number": t.get("number"),
+        "title": t.get("title"),
+        "url": _task_url(t["id"]) if t.get("id") else None,
+    }
+
+
+@mcp.tool
+async def list_trashed_tasks(ctx: Context, limit: int = 20) -> dict:
+    """현재 프로젝트 휴지통(삭제된 태스크) 목록을 조회한다. 복구(restore_task) 대상 식별용.
+
+    삭제된 태스크는 일반 조회(list_my_tasks/get_task)에서 빠지므로, 복구하려면 이 목록에서
+    id/제목을 확인한다. 각 항목에 삭제 시각(deleted_at)·삭제자(deleted_by)를 포함한다.
+    현재 레포 프로젝트로 스코프되며(project 명시 전송), 관리자 이상만 유효한 결과를 받는다.
+    한 요청으로 최대 100개까지 받아 최신 삭제순 상위 limit개를 반환한다(count는 전체 삭제 수).
+    """
+    project_id, items, total = await _trashed_items(ctx)
+    trimmed = items[:limit]
+    return {
+        "project_id": project_id,
+        "count": total,
+        "shown": len(trimmed),
+        "tasks": [
+            {
+                "id": r["id"],
+                "number": r.get("number"),
+                "title": r.get("title"),
+                "deleted_at": r.get("deleted_at"),
+                "deleted_by": r.get("deleted_by_name"),
+                "url": _task_url(r["id"]),
+            }
+            for r in trimmed
+        ],
+    }
 
 
 # --- 프롬프트(슬래시 커맨드) — Claude Desktop·Code 양쪽에서 사용 -------------------
