@@ -86,6 +86,77 @@ def test_bullet_then_paragraph_closes_ul():
 
 
 # ---------------------------------------------------------------------------
+# URL 자동 연동 — 평문의 http/https 맨 URL을 <a href>로 (#409, description·댓글 공통)
+# ---------------------------------------------------------------------------
+
+def test_bare_url_in_bullet_becomes_anchor():
+    """블렛의 맨 URL은 클릭 가능한 <a>로 변환된다."""
+    out = description_to_html("- https://gdc.gemiso.com/tasks/14957")
+    assert out == (
+        "<ul><li><p>"
+        '<a target="_blank" rel="noopener noreferrer" '
+        'href="https://gdc.gemiso.com/tasks/14957">https://gdc.gemiso.com/tasks/14957</a>'
+        "</p></li></ul>"
+    )
+
+
+def test_url_inside_paragraph_text():
+    """문장 속 URL만 링크로 감싸고 앞뒤 텍스트는 그대로 둔다."""
+    out = description_to_html("본문 https://example.com 참고")
+    assert out == (
+        '<p>본문 <a target="_blank" rel="noopener noreferrer" '
+        'href="https://example.com">https://example.com</a> 참고</p>'
+    )
+
+
+def test_url_query_ampersand_is_escaped_in_href_and_text():
+    """URL의 &는 href·표시 텍스트 모두 &amp;로 이스케이프(유효 HTML)."""
+    out = description_to_html("- https://x.com/a?b=1&c=2")
+    assert out == (
+        "<ul><li><p>"
+        '<a target="_blank" rel="noopener noreferrer" '
+        'href="https://x.com/a?b=1&amp;c=2">https://x.com/a?b=1&amp;c=2</a>'
+        "</p></li></ul>"
+    )
+
+
+def test_trailing_punctuation_excluded_from_url():
+    """URL 뒤 마침표·쉼표·닫는 괄호는 링크에 포함하지 않는다."""
+    out = description_to_html("참고 https://example.com.")
+    assert out == (
+        '<p>참고 <a target="_blank" rel="noopener noreferrer" '
+        'href="https://example.com">https://example.com</a>.</p>'
+    )
+
+
+def test_non_url_angle_text_not_linked_and_still_escaped():
+    """URL이 아닌 부등호 텍스트는 링크 없이 그대로 이스케이프(오탐 없음)."""
+    out = description_to_html("- progress<100 && a>b")
+    assert out == "<ul><li><p>progress&lt;100 &amp;&amp; a&gt;b</p></li></ul>"
+
+
+def test_label_line_with_brackets_not_linkified():
+    """라벨 마커(`[...]`)는 URL 처리 대상이 아니다(형식 유지)."""
+    out = description_to_html("[작업 내용]\n- https://example.com")
+    assert out == (
+        "<p><strong>작업 내용</strong></p>"
+        "<ul><li><p>"
+        '<a target="_blank" rel="noopener noreferrer" '
+        'href="https://example.com">https://example.com</a>'
+        "</p></li></ul>"
+    )
+
+
+def test_comment_path_autolinks_via_normalize():
+    """댓글 경로(normalize_description)도 같은 자동 연동을 받는다."""
+    out = normalize_description("확인 https://example.com")
+    assert out == (
+        '<p>확인 <a target="_blank" rel="noopener noreferrer" '
+        'href="https://example.com">https://example.com</a></p>'
+    )
+
+
+# ---------------------------------------------------------------------------
 # normalize_description — 생성/수정/동기화 공통 진입점 (HTML 감지 → 통과 / 평문 → 변환)
 # ---------------------------------------------------------------------------
 

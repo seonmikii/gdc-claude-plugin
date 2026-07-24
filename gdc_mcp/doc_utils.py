@@ -18,6 +18,37 @@ _HEADING_RE = re.compile(r"^#{1,6}\s")
 _CHECKBOX_RE = re.compile(r"^\s*[-*]\s*\[( |x|X)\]\s")
 _LABEL_RE = re.compile(r"^\[(.+)\]$")
 _BULLET_RE = re.compile(r"^\s*[-*]\s+(.+)$")
+# 평문 속 맨 URL(http/https)을 링크로 자동 연동(#409). 공백/부등호/따옴표에서 끊는다.
+_URL_RE = re.compile(r"""https?://[^\s<>"']+""")
+# URL 끝에 붙는 문장부호는 링크에서 제외(예: "...example.com." 의 마침표).
+_URL_TRAILING = ".,;:!?)]}"
+
+
+def _escape_and_linkify(text: str) -> str:
+    """평문을 이스케이프하되 http/https 맨 URL은 `<a>` 링크로 감싼다(#409).
+
+    비-URL 구간은 `html.escape`로 그대로 이스케이프하고, URL 구간만 GDC 리치텍스트가
+    지원하는 `<a target="_blank" rel="noopener noreferrer" href="...">`로 만든다(실증: 태스크 #292).
+    URL 뒤 문장부호(마침표·쉼표·닫는 괄호 등)는 링크에 포함하지 않는다.
+    """
+    out: list[str] = []
+    last = 0
+    for m in _URL_RE.finditer(text):
+        out.append(html.escape(text[last : m.start()], quote=False))
+        url = m.group(0)
+        trailing_len = 0
+        while url and url[-1] in _URL_TRAILING:
+            url = url[:-1]
+            trailing_len += 1
+        esc = html.escape(url, quote=False)
+        out.append(
+            f'<a target="_blank" rel="noopener noreferrer" href="{esc}">{esc}</a>'
+        )
+        last = m.end() - trailing_len
+    out.append(html.escape(text[last:], quote=False))
+    return "".join(out)
+
+
 # 이미 HTML(리치텍스트)인지 판별용 — 실제 태그명 뒤가 와야 매칭(평문의 'a < b'는 미매칭)
 _HTML_TAG_RE = re.compile(
     r"</?(?:p|br|ul|ol|li|div|span|strong|em|b|i|a|h[1-6]|table|thead|tbody|tr|td|th|blockquote|pre|code)\b",
@@ -84,7 +115,7 @@ def description_to_html(text: str) -> str:
         for line in sec:
             mb = _BULLET_RE.match(line)
             if mb:
-                bullets.append(html.escape(mb.group(1).strip(), quote=False))
+                bullets.append(_escape_and_linkify(mb.group(1).strip()))
                 continue
             if bullets:  # 블렛이 아닌 줄을 만나면 열린 <ul>을 닫는다
                 parts.append(_ul(bullets))
@@ -95,7 +126,7 @@ def description_to_html(text: str) -> str:
                 label = html.escape(ml.group(1).strip(), quote=False)
                 parts.append(f"<p><strong>{label}</strong></p>")
             else:
-                parts.append(f"<p>{html.escape(stripped, quote=False)}</p>")
+                parts.append(f"<p>{_escape_and_linkify(stripped)}</p>")
         if bullets:
             parts.append(_ul(bullets))
         html_sections.append("".join(parts))
