@@ -12,6 +12,7 @@ import datetime
 import html
 import os
 import re
+import time
 from pathlib import Path
 
 import httpx
@@ -56,6 +57,34 @@ def _task_url(task_id: int) -> str:
 # -number 정렬 목록을 페이지로 훑으며 대상 번호를 수집한다. 대부분 프로젝트는 1페이지로 해결.
 _MENTION_PAGE_SIZE = 200
 _MENTION_MAX_PAGES = 5
+
+
+# --- 프로젝트 상세 캐시 ---------------------------------------------------------
+# 상태 enum·멤버·preset은 세션 중 거의 바뀌지 않는데 대부분의 태스크 도구가 이를 필요로 해
+# 같은 프로젝트를 반복 GET한다(도구 1회 호출 안에서 2회 이상 겹치는 경로도 있다).
+# 짧은 TTL 캐시로 왕복만 줄인다. 태스크 상세는 캐시하지 않는다 — 편집 직후 재조회가 잦아
+# stale 위험이 실익보다 크다.
+_PROJECT_TTL = 60.0
+_PROJECT_CACHE: dict[int, tuple[float, dict]] = {}
+
+
+def _project(project_id: int) -> dict:
+    """프로젝트 상세를 TTL(60초) 프로세스 캐시로 조회한다.
+
+    프로젝트 설정 변경은 세션 중 드물어 TTL만으로 충분하고, 컨텍스트 전환(set_context)
+    시점에는 캐시를 비운다.
+    """
+    now = time.monotonic()
+    cached = _PROJECT_CACHE.get(project_id)
+    if cached and now - cached[0] < _PROJECT_TTL:
+        return cached[1]
+    data = client.get(f"/api/projects/{project_id}/").json()
+    _PROJECT_CACHE[project_id] = (now, data)
+    return data
+
+
+def _clear_project_cache() -> None:
+    _PROJECT_CACHE.clear()
 
 
 def _has_task_mentions(text: str | None) -> bool:
@@ -196,7 +225,7 @@ async def get_context(ctx: Context) -> dict:
     project_name = None
     if c.get("project_id"):
         try:
-            project_name = client.get(f"/api/projects/{c['project_id']}/").json().get("name")
+            project_name = _project(c["project_id"]).get("name")
         except Exception:
             project_name = None
     return {
@@ -268,9 +297,10 @@ async def set_context(ctx: Context, workspace_id: int, project_id: int) -> dict:
     """
     root = await _current_root(ctx)
     tokens.save_context(root, workspace_id, project_id)
+    _clear_project_cache()  # 컨텍스트 전환 시 이전 프로젝트 상세를 남기지 않는다
     project_name = None
     try:
-        project_name = client.get(f"/api/projects/{project_id}/").json().get("name")
+        project_name = _project(project_id).get("name")
     except Exception:
         project_name = None
     return {
@@ -289,7 +319,7 @@ def get_project_enums(project_id: int) -> dict:
     완료 상태 = category=='done', 미완료 상태 = 그 보집합.
     태스크 생성/수정/필터 전에 유효한 값과 '미완료 집합'을 확인하는 용도.
     """
-    p = client.get(f"/api/projects/{project_id}/").json()
+    p = _project(project_id)
     statuses = [
         {
             "name": s["name"],
@@ -320,8 +350,12 @@ def get_project_enums(project_id: int) -> dict:
     }
 
 
-def _not_finished_names(project_id: int) -> list[str]:
-    p = client.get(f"/api/projects/{project_id}/").json()
+def _not_finished_names(project_id: int, project: dict | None = None) -> list[str]:
+    """프로젝트의 미완료(category != 'done') 상태 이름 목록.
+
+    project에 프로젝트 상세 응답을 넘기면 재조회 없이 재사용한다.
+    """
+    p = project if project is not None else _project(project_id)
     return [s["name"] for s in p.get("task_statuses", []) if s.get("category") != "done"]
 
 
@@ -480,7 +514,7 @@ def _resolve_members(
         return assignee, participant_ids
 
     if project is None:
-        project = client.get(f"/api/projects/{project_id}/").json()
+        project = _project(project_id)
     members = project.get("members", [])
     ids = {m.get("user") for m in members}
     by_name: dict[str, int] = {}
@@ -606,6 +640,188 @@ async def _resolve_task(
     )
 
 
+# --- 태스크 검색 ---------------------------------------------------------------
+
+# 서버 TaskViewSet.ordering_fields(gdc-service backend/tasks/views.py)와 동일해야 한다.
+# 서버는 미허용 값을 조용히 무시하므로, 오타를 여기서 잡아 사용자에게 알린다.
+_ORDERING_FIELDS = {
+    "created_at", "updated_at", "planned_start_date", "planned_end_date",
+    "actual_start_date", "actual_end_date", "priority", "status",
+    "number", "title", "progress",
+}
+
+# undated는 서버 필터가 없어 클라이언트에서 거른다 → 넉넉히 선취(서버 max_page_size와 동일).
+_SEARCH_MAX_PAGE_SIZE = 200
+
+
+def _search_params(
+    project_id: int,
+    query: str | None = None,
+    status: list[str] | None = None,
+    priority: list[str] | None = None,
+    task_type: list[str] | None = None,
+    assignee_id: int | None = None,
+    participant_ids: list[int] | None = None,
+    customer_id: int | None = None,
+    planned_end_from: str | None = None,
+    planned_end_to: str | None = None,
+    root_only: bool = False,
+    not_finished_names: list[str] | None = None,
+    overdue: bool = False,
+    undated: bool = False,
+    ordering: str | None = None,
+    limit: int = 20,
+) -> dict[str, str | int]:
+    """search_tasks의 서버 질의 파라미터를 조립한다(네트워크 없음 — 단위 테스트 대상).
+
+    멤버·고객사 이름 해석은 호출부에서 끝내고 여기엔 id와 상태 이름만 넘긴다.
+    - 리스트 필터(status/priority/task_type/participant)는 서버의 CSV `BaseInFilter` 형식으로 변환.
+    - status를 명시하면 not_finished_names보다 우선한다.
+    - overdue는 `planned_end_date_to=어제`로 서버에서 처리(planned_end_to와 함께 주면 더 이른 쪽).
+    - undated는 서버 필터가 없어 page_size를 최대로 올려 선취한 뒤 호출부에서 거른다.
+    """
+    if query and root_only:
+        raise ValueError(
+            "query와 root_only는 함께 쓸 수 없습니다. 서버 검색은 매칭된 하위 태스크를 "
+            "그대로 반환하므로 root_only가 이를 걸러내 결과가 누락됩니다. "
+            "키워드 검색은 root_only=False로 하세요."
+        )
+    if ordering and ordering.lstrip("-") not in _ORDERING_FIELDS:
+        raise ValueError(
+            f"정렬 기준 '{ordering}'은(는) 지원하지 않습니다. "
+            f"가능한 값: {', '.join(sorted(_ORDERING_FIELDS))} (내림차순은 앞에 '-')"
+        )
+    for label, value in (("종료일 시작(planned_end_from)", planned_end_from),
+                         ("종료일 끝(planned_end_to)", planned_end_to)):
+        if value:
+            _parse_date(value, label)
+    if planned_end_from and planned_end_to and planned_end_from > planned_end_to:
+        raise ValueError(
+            f"planned_end_from({planned_end_from})은 planned_end_to({planned_end_to})보다 늦을 수 없습니다."
+        )
+
+    params: dict[str, str | int] = {
+        "project": project_id,
+        "page_size": _SEARCH_MAX_PAGE_SIZE if undated else min(limit, _SEARCH_MAX_PAGE_SIZE),
+    }
+    if query:
+        params["search"] = query
+    if status:
+        params["status"] = ",".join(status)
+    elif not_finished_names:
+        params["status"] = ",".join(not_finished_names)
+    if priority:
+        params["priority"] = ",".join(priority)
+    if task_type:
+        params["task_type"] = ",".join(task_type)
+    if assignee_id is not None:
+        params["assignee"] = assignee_id
+    if participant_ids:
+        params["participant"] = ",".join(str(p) for p in participant_ids)
+    if customer_id is not None:
+        params["customer"] = customer_id
+    if planned_end_from:
+        params["planned_end_date_from"] = planned_end_from
+    end_to = planned_end_to
+    if overdue:
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        end_to = min(end_to, yesterday) if end_to else yesterday
+    if end_to:
+        params["planned_end_date_to"] = end_to
+    if root_only:
+        params["root_only"] = "true"
+    if ordering:
+        params["ordering"] = ordering
+    return params
+
+
+@mcp.tool
+async def search_tasks(
+    ctx: Context,
+    query: str | None = None,
+    status: list[str] | None = None,
+    priority: list[str] | None = None,
+    task_type: list[str] | None = None,
+    assignee: int | str | None = None,
+    participant: list[int | str] | None = None,
+    customer: int | str | None = None,
+    planned_end_from: str | None = None,
+    planned_end_to: str | None = None,
+    root_only: bool = False,
+    not_finished: bool = False,
+    overdue: bool = False,
+    undated: bool = False,
+    ordering: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """현재 레포 프로젝트에서 키워드·필터로 태스크를 검색한다.
+
+    조회 범위는 **현재 레포에서 gdc_login/set_context로 선택한 프로젝트**로 고정된다(미설정 시 오류).
+    "내 태스크"는 list_my_tasks, "특정 담당자 태스크"는 list_tasks가 더 간단하다 —
+    이 도구는 키워드나 여러 조건을 조합할 때 쓴다.
+
+    - query: 제목·본문·댓글(멘션) 통합 검색어. **생략 가능**(필터만으로도 조회된다).
+      주의: 서버가 결과를 번호 내림차순(고정 태스크 우선)으로 재정렬하므로 **관련도순이 아니다** —
+      매칭이 많으면 "가장 관련 있는 N건"이 아니라 "매칭 중 최신 N건"이 온다. 응답의
+      total_matched로 전체 매칭 수를 확인하고, 필요하면 필터를 좁히거나 limit을 올린다.
+    - query는 root_only와 함께 쓸 수 없다(검색이 매칭한 하위 태스크가 통째로 걸러진다).
+    - status/priority/task_type: 상태·우선순위·유형 이름 목록(합집합). 값은 get_project_enums 참고.
+    - assignee/participant/customer: user id 또는 **멤버 이름**, 고객사 id 또는 **고객사 이름** 허용.
+    - planned_end_from/planned_end_to: 계획 종료일 범위(YYYY-MM-DD).
+    - not_finished: 완료(category=='done')가 아닌 상태만. status를 직접 주면 그 값이 우선한다.
+      **기본값은 False라 완료된 태스크도 함께 나온다**(끝난 태스크를 찾는 것도 검색의 목적이다).
+      list_my_tasks/list_tasks는 반대로 미해결만 보는 도구라 기본값이 True다 —
+      "미완료만" 검색하려면 not_finished=True를 명시해야 한다.
+    - overdue: 계획 종료일이 지난 것만(서버 필터). not_finished와 독립이다.
+    - undated: 계획 종료일이 없는 것만. 서버 필터가 없어 200건을 받아 거르므로,
+      200건을 넘는 프로젝트에서는 누락될 수 있다.
+    - ordering: number/title/status/priority/progress/created_at/updated_at/planned_*/actual_* 중 하나
+      (내림차순은 '-' 접두, 예: '-planned_end_date'). 생략 시 서버 기본(번호 내림차순).
+    - 응답: count(반환 건수)·total_matched(서버 전체 매칭 수)·tasks(요약 목록).
+    """
+    ctx_data = await _resolve_context(ctx)
+    project_id = ctx_data.get("project_id")
+    if project_id is None:
+        raise ValueError(
+            "프로젝트가 설정되지 않았습니다. gdc_login 또는 set_context로 프로젝트를 선택하세요."
+        )
+
+    # 멤버 해석과 미완료 상태 목록은 같은 프로젝트 상세를 쓰므로 한 번만 받아 재사용한다.
+    project = None
+    if assignee is not None or participant or not_finished:
+        project = _project(project_id)
+    assignee_id, participant_ids = _resolve_members(
+        project_id, assignee, participant, project=project
+    )
+    customer_id = (
+        _resolve_customer(ctx_data.get("workspace_id"), customer) if customer is not None else None
+    )
+
+    params = _search_params(
+        project_id,
+        query=query,
+        status=status,
+        priority=priority,
+        task_type=task_type,
+        assignee_id=assignee_id,
+        participant_ids=participant_ids,
+        customer_id=customer_id,
+        planned_end_from=planned_end_from,
+        planned_end_to=planned_end_to,
+        root_only=root_only,
+        not_finished_names=_not_finished_names(project_id, project=project) if not_finished else None,
+        overdue=overdue,
+        undated=undated,
+        ordering=ordering,
+        limit=limit,
+    )
+    data = client.get(_TASKS, params=params).json()
+    # overdue는 서버 필터로 처리했으므로 클라이언트 필터는 undated만 적용한다.
+    out = _finalize_task_list(data.get("results", []), False, undated, limit)
+    out["total_matched"] = data.get("count")
+    return out
+
+
 @mcp.tool
 async def create_task(
     ctx: Context,
@@ -624,7 +840,6 @@ async def create_task(
     parent: int | None = None,
     customer: int | str | None = None,
     weight: int | None = None,
-    tag_ids: list[int] | None = None,
     participant_ids: list[int | str] | None = None,
 ) -> dict:
     """태스크를 생성한다. 필수: project(프로젝트 ID), title.
@@ -663,8 +878,11 @@ async def create_task(
     확장 필드(사용자가 명시할 때만 전달 — 질문으로 강요하지 않음):
     parent(상위 태스크 id), customer(고객사 id **또는 이름** — 이름은 현재 워크스페이스에서
     자동 해석, 모호하면 후보 안내), actual_start_date/actual_end_date, progress(0~100),
-    tag_ids(태그 id 리스트), weight(비중 % — **WBS 프로젝트 전용**, 비WBS는 호출 전 차단.
+    weight(비중 % — **WBS 프로젝트 전용**, 비WBS는 호출 전 차단.
     형제 그룹 비중 합 100 초과는 서버가 검증).
+
+    태그는 지정할 수 없다 — 서버가 태스크의 태그를 본문·댓글의 tagMention에서만 동기화하므로
+    태그 id를 보내도 무시된다(읽기는 get_task의 tags로 가능).
 
     제약(미충족 시 호출 전 ValueError로 안내·차단): 예상/실제 시작일 ≤ 종료일, 실제 종료일 미래 불가,
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
@@ -675,7 +893,7 @@ async def create_task(
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
     # 프로젝트 상세는 멤버 해석·WBS 가드·완료 카테고리 판정에 공용 — 필요할 때 1회만 조회
     project_json = (
-        client.get(f"/api/projects/{project}/").json()
+        _project(project)
         if (weight is not None or assignee is not None or participant_ids or status)
         else None
     )
@@ -707,7 +925,6 @@ async def create_task(
         "parent": parent,
         "customer": customer,
         "weight": weight,
-        "tag_ids": tag_ids,
         "participant_ids": participant_ids,
     }
     # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정 (명시 전달값 우선)
@@ -761,7 +978,6 @@ async def update_task(
     parent: int | None = None,
     weight: int | None = None,
     is_pinned: bool | None = None,
-    tag_ids: list[int] | None = None,
     participant_ids: list[int | str] | None = None,
     clear_fields: list[str] | None = None,
 ) -> dict:
@@ -777,7 +993,8 @@ async def update_task(
 
     사용자가 수정 권한을 가진 모든 편집 필드를 노출한다(읽기전용 id/number/creator 제외).
     status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인),
-    날짜는 'YYYY-MM-DD', parent는 ID, tag_ids는 ID 리스트.
+    날짜는 'YYYY-MM-DD', parent는 ID.
+    태그는 수정할 수 없다 — 서버가 본문·댓글의 tagMention에서만 태그를 동기화한다(읽기는 get_task).
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
     customer는 고객사 id **또는 이름** — 이름은 현재 워크스페이스에서 검색해 정확 일치를 자동 채택,
     모호하면 후보 목록으로 안내한다.
@@ -796,7 +1013,7 @@ async def update_task(
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
     if weight is not None or assignee is not None or participant_ids:
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
-        project_json = client.get(f"/api/projects/{project_id}/").json()
+        project_json = _project(project_id)
         if weight is not None:
             _ensure_wbs_weight(project_json)
         assignee, participant_ids = _resolve_members(
@@ -825,7 +1042,6 @@ async def update_task(
             "parent": parent,
             "weight": weight,
             "is_pinned": is_pinned,
-            "tag_ids": tag_ids,
             "participant_ids": participant_ids,
         }.items()
         if v is not None
@@ -950,7 +1166,7 @@ def _status_category(
     if not project_id or not status_name:
         return None
     if project is None:
-        project = client.get(f"/api/projects/{project_id}/").json()
+        project = _project(project_id)
     for s in project.get("task_statuses", []):
         if s.get("name") == status_name:
             return s.get("category")
@@ -1022,6 +1238,11 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
     - sub_tasks: 이 태스크의 하위 태스크 요약 목록(휴지통 제외, 서버 가시성 필터 적용).
     - related_tasks: outgoing/incoming 링크를 방향 유지로 통합({direction, link_type, task}).
     - parent: 직속 상위 태스크 요약(없으면 null).
+    - update_task로 쓸 수 있는 값도 함께 읽는다 — actual_start_date/actual_end_date(실제 날짜),
+      customer/customer_name(고객사), weight(비중, WBS 전용), is_pinned(고정), participants(관련자).
+      수정 전 현재 값 확인과 수정 후 반영 확인에 쓴다.
+    - 그 밖에 creator_name(작성자)·tags(태그 이름)·mention_count(댓글 수)·is_archived(숨김)·
+      created_at/updated_at을 함께 반환한다.
     상세 API 1회 호출로 모두 받으므로 추가 왕복이 없다(제목 해석 시 검색 1회 추가).
     """
     resolved_id = await _resolve_task(ctx, task_id)
@@ -1043,7 +1264,23 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
         "progress": t.get("progress"),
         "planned_start_date": t.get("planned_start_date"),
         "planned_end_date": t.get("planned_end_date"),
+        "actual_start_date": t.get("actual_start_date"),
+        "actual_end_date": t.get("actual_end_date"),
         "assignee_name": t.get("assignee_name"),
+        "participants": [
+            {"id": p.get("id"), "name": p.get("full_name") or p.get("username")}
+            for p in (t.get("participants_detail") or [])
+        ],
+        "creator_name": t.get("creator_name"),
+        "customer": t.get("customer"),
+        "customer_name": t.get("customer_name"),
+        "weight": t.get("weight"),
+        "is_pinned": t.get("is_pinned"),
+        "is_archived": t.get("is_archived"),
+        "tags": [g.get("name") for g in (t.get("tag_list") or [])],
+        "mention_count": t.get("mention_count"),
+        "created_at": t.get("created_at"),
+        "updated_at": t.get("updated_at"),
         "url": _task_url(t["id"]),
         "parent": _parent_summary(t),
         "sub_tasks": [_task_summary(s) for s in (t.get("sub_tasks") or [])],
@@ -1101,7 +1338,7 @@ def _apply_progress_sync(task_id: int, new_progress: int, description: str | Non
     """
     cur = client.get(f"{_TASKS}{task_id}/").json()
     project_id = cur.get("project")
-    statuses = client.get(f"/api/projects/{project_id}/").json().get("task_statuses", [])
+    statuses = _project(project_id).get("task_statuses", [])
     cat_of = {s["name"]: s.get("category") for s in statuses}
 
     def _pick(category: str, preferred: tuple[str, ...]) -> str | None:
@@ -1187,7 +1424,7 @@ def _done_status_name(project_id: int) -> str | None:
     완료 계열인 것을 우선('해결'/resolved보다 우선), 없으면 첫 done 상태.
     문서 메타데이터 상태가 done일 때 매핑 대상.
     """
-    statuses = client.get(f"/api/projects/{project_id}/").json().get("task_statuses", [])
+    statuses = _project(project_id).get("task_statuses", [])
     done = [s for s in statuses if s.get("category") == "done"]
     preferred = ("완료", "완료됨", "completed", "done", "closed", "종료")
     for s in done:
@@ -1202,7 +1439,7 @@ def _in_progress_status_name(project_id: int) -> str | None:
     category=='in_progress' 중 name이 '진행'/'진행중'/'in progress'인 것을 우선,
     없으면 첫 in_progress 상태. 문서 메타데이터 상태가 partial일 때 매핑 대상.
     """
-    statuses = client.get(f"/api/projects/{project_id}/").json().get("task_statuses", [])
+    statuses = _project(project_id).get("task_statuses", [])
     inprog = [s for s in statuses if s.get("category") == "in_progress"]
     for s in inprog:
         if s["name"].lower().replace(" ", "") in ("inprogress", "진행", "진행중"):
@@ -1368,7 +1605,7 @@ def _resolve_mention_usernames(
     if not mentions:
         return []
     if project is None:
-        project = client.get(f"/api/projects/{project_id}/").json()
+        project = _project(project_id)
     members = project.get("members", [])
     by_id: dict[int, tuple[str, str] | None] = {}
     by_name: dict[str, tuple[str, str] | None] = {}
@@ -1768,6 +2005,164 @@ async def list_trashed_tasks(ctx: Context, limit: int = 20) -> dict:
                 "url": _task_url(r["id"]),
             }
             for r in trimmed
+        ],
+    }
+
+
+# --- 알림·멘션 조회 -------------------------------------------------------------
+# 조회 전용이다. 읽음 처리(mark_read/read-all)는 노출하지 않는다 — 에이전트가 사용자의
+# 웹 UI 읽음 상태를 바꾸지 않게 한다.
+
+_NOTIFICATIONS = "/api/notifications/"
+_DASHBOARD_MENTIONS = "/api/dashboard/mentions/"
+
+# 서버 NotificationPagination의 max_page_size.
+_NOTIFICATION_MAX_PAGE_SIZE = 99
+# /api/dashboard/mentions/는 pagination_class를 두지 않아 DRF 전역 PAGE_SIZE(20)로 고정되고
+# page_size 쿼리 파라미터를 받지 않는다 → limit을 채우려면 page를 넘겨가며 모은다.
+_MENTION_LIST_PAGE_SIZE = 20
+_MENTION_LIST_MAX_PAGES = 10
+
+_NOTIFICATION_LABELS = {
+    "mention": "멘션", "description_mention": "설명 멘션",
+    "assignee_change": "담당자 변경", "task_comment": "태스크 댓글",
+    "participant_added": "관련자 추가", "task_status_changed": "태스크 상태 변경",
+    "task_updated": "태스크 수정",
+}
+
+_DANGLING_TAG_RE = re.compile(r"<[^>]*$")
+
+
+def _mention_preview(raw: str | None, limit: int = 100) -> str:
+    """멘션 미리보기(서버가 HTML을 자른 100자 조각)를 평문으로 정리한다.
+
+    서버는 content_preview를 `mention.content[:100]`로 만들어 HTML 태그가 그대로 남고
+    끝이 태그 중간에서 잘리기도 한다(알림 쪽 serializer와 달리 strip_tags를 하지 않는다).
+    잘린 꼬리 태그를 먼저 버리고 평문화한 뒤 다시 limit자로 맞춘다.
+    """
+    if not raw:
+        return ""
+    text = html_to_text(_DANGLING_TAG_RE.sub("", raw))
+    text = " ".join(text.split())
+    return text[:limit]
+
+
+@mcp.tool
+def list_my_notifications(unread_only: bool = False, limit: int = 20) -> dict:
+    """내 알림 목록을 조회한다(조회 전용 — 읽음 처리는 하지 않는다).
+
+    멘션·담당자 변경·댓글·상태 변경 등 나를 수신자로 하는 알림을 최신순으로 반환하고,
+    미읽음 총 개수(unread_count)를 함께 준다.
+    - unread_only=True면 읽지 않은 알림만 조회한다.
+    - limit은 최대 99(서버 상한). 그보다 많이 요청해도 99로 자른다.
+    - **워크스페이스/프로젝트 스코프가 없다** — 서버가 수신자 기준으로만 거르므로 다른
+      워크스페이스의 알림이 섞여 온다. 항목의 project_name으로 구분한다.
+    - 각 항목의 url로 get_task/open_task를 이어서 호출할 수 있다.
+    """
+    params: dict[str, str | int] = {"page_size": min(limit, _NOTIFICATION_MAX_PAGE_SIZE)}
+    if unread_only:
+        params["is_read"] = "false"
+    data = client.get(_NOTIFICATIONS, params=params).json()
+    unread = client.get(f"{_NOTIFICATIONS}unread-count/").json().get("count")
+    items = data.get("results", [])[:limit]
+    return {
+        "count": len(items),
+        "total": data.get("count"),
+        "unread_count": unread,
+        "notifications": [
+            {
+                "id": n.get("id"),
+                "type": n.get("notification_type"),
+                "type_label": _NOTIFICATION_LABELS.get(
+                    n.get("notification_type"), n.get("notification_type")
+                ),
+                "title": n.get("title"),
+                "preview": n.get("content_preview"),
+                "sender_name": n.get("sender_name"),
+                "is_read": n.get("is_read"),
+                "task_id": n.get("related_task"),
+                "task_number": n.get("task_number"),
+                "task_title": n.get("task_title"),
+                "project_name": n.get("project_name"),
+                "created_at": n.get("created_at"),
+                "url": _task_url(n["related_task"]) if n.get("related_task") else None,
+            }
+            for n in items
+        ],
+    }
+
+
+@mcp.tool
+async def list_my_mentions(
+    ctx: Context,
+    mention_type: str = "both",
+    project_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    search: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """나와 관련된 댓글 멘션 목록을 최신순으로 조회한다(조회 전용).
+
+    알림(list_my_notifications)과 달리 **댓글 본문**을 훑는 용도다 — 어떤 태스크에서 무슨
+    이야기가 오갔는지 확인할 때 쓴다.
+    - mention_type: 'mentioned'(나를 언급한 것)/'authored'(내가 쓴 것)/'both'(기본).
+    - 스코프: 현재 레포 컨텍스트의 워크스페이스 + 프로젝트를 기본 적용한다. project_id를
+      직접 주면 그 프로젝트로 바꿔 조회한다.
+    - date_from/date_to: 작성일 범위(YYYY-MM-DD). search: 댓글 본문 부분 일치.
+    - preview는 서버가 100자로 자른 조각을 평문화한 값이라 문장이 중간에서 끊길 수 있다.
+      전체 내용은 url이나 list_task_comments(task_id)로 확인한다.
+    """
+    if mention_type not in ("mentioned", "authored", "both"):
+        raise ValueError(
+            f"mention_type은 'mentioned'/'authored'/'both' 중 하나여야 합니다: {mention_type!r}"
+        )
+    for label, value in (("date_from", date_from), ("date_to", date_to)):
+        if value:
+            _parse_date(value, label)
+
+    ctx_data = await _resolve_context(ctx)
+    params: dict[str, str | int] = {"mention_type": mention_type}
+    if ctx_data.get("workspace_id") is not None:
+        params["workspace"] = ctx_data["workspace_id"]
+    scope_project = project_id if project_id is not None else ctx_data.get("project_id")
+    if scope_project is not None:
+        params["project_id"] = scope_project
+    if date_from:
+        params["date_from"] = date_from
+    if date_to:
+        params["date_to"] = date_to
+    if search:
+        params["search"] = search
+
+    # 서버가 20건 페이지로 고정이라 limit을 채울 때까지 page를 넘긴다.
+    items: list[dict] = []
+    total = None
+    for page in range(1, _MENTION_LIST_MAX_PAGES + 1):
+        data = client.get(_DASHBOARD_MENTIONS, params={**params, "page": page}).json()
+        total = data.get("count")
+        items.extend(data.get("results", []))
+        if len(items) >= limit or not data.get("next"):
+            break
+    items = items[:limit]
+
+    return {
+        "count": len(items),
+        "total": total,
+        "project_id": scope_project,
+        "mentions": [
+            {
+                "id": m.get("id"),
+                "author_name": m.get("author_name"),
+                "task_id": m.get("task_id"),
+                "task_number": m.get("task_number"),
+                "task_title": m.get("task_title"),
+                "project_name": m.get("project_name"),
+                "preview": _mention_preview(m.get("content_preview")),
+                "created_at": m.get("created_at"),
+                "url": _task_url(m["task_id"]) if m.get("task_id") else None,
+            }
+            for m in items
         ],
     }
 
