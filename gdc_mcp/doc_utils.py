@@ -93,7 +93,8 @@ def _escape_and_linkify(text: str, resolve_task: TaskResolver | None = None) -> 
     return "".join(out)
 
 
-# 이미 HTML(리치텍스트)인지 판별용 — 실제 태그명 뒤가 와야 매칭(평문의 'a < b'는 미매칭)
+# 이미 HTML(리치텍스트)인지 판별용 — 실제 태그명 뒤가 와야 매칭(평문의 'a < b'는 미매칭).
+# `is_html`이 선두에서만 `match`하므로, 문장 중간의 리터럴 태그는 걸리지 않는다.
 _HTML_TAG_RE = re.compile(
     r"</?(?:p|br|ul|ol|li|div|span|strong|em|b|i|a|h[1-6]|table|thead|tbody|tr|td|th|blockquote|pre|code)\b",
     re.IGNORECASE,
@@ -101,12 +102,17 @@ _HTML_TAG_RE = re.compile(
 
 
 def is_html(text: str | None) -> bool:
-    """이미 GDC 리치텍스트(HTML)인지 판별한다.
+    """이미 GDC 리치텍스트(HTML)인지 판별한다 — **텍스트가 태그로 시작할 때만** HTML로 본다.
 
     `normalize_description`이 통과시킬 입력인지 미리 알 수 있어, 서버 계층이 불필요한
     선행 조회(예: `#N` 번호→id 매핑)를 건너뛰는 데도 쓴다.
+
+    선두 앵커링 이유: 아무 위치나 `search`하면 문장 속 리터럴 태그(예: `평문 <p>@user</p>만
+    붙는다`)까지 HTML로 오판해 변환을 건너뛰고 본문이 한 줄로 뭉개진다(태스크 #417 실증).
+    정상 HTML은 `description_to_html` 산출물·GDC 에디터 저장본 모두 블록 태그로 시작하므로
+    선행 공백만 무시하면 통과 동작이 유지된다.
     """
-    return bool(text) and bool(_HTML_TAG_RE.search(text))
+    return bool(text) and bool(_HTML_TAG_RE.match(text.lstrip()))
 
 
 def normalize_description(
@@ -119,11 +125,12 @@ def normalize_description(
     그대로 통과**시켜 이중 변환(예: 이미 변환된 `task_from_doc` 산출물, 에이전트가 직접 넘긴 HTML)을 막는다.
 
     - None → None (변경 없음/필드 생략 신호를 그대로 전달).
-    - 블록/인라인 태그가 있으면 이미 HTML로 보고 **그대로 통과**.
-    - 그 외 평문은 `description_to_html`로 변환.
+    - **태그로 시작하면**(선행 공백 무시) 이미 HTML로 보고 **그대로 통과**(`is_html`).
+    - 그 외 평문은 `description_to_html`로 변환 — 문장 중간의 리터럴 태그(`평문 <p>…`)는
+      평문 그대로 취급되어 이스케이프된다.
 
-    주의: 평문에 리터럴 태그 문자열(예: 문장 속 `<p>`)이 있으면 HTML로 오판할 수 있다(희귀).
-    확실히 변환이 필요하면 라벨 섹션 템플릿(평문)을 쓴다.
+    주의: 평문 설명이 앞에 붙은 HTML(`설명 한 줄\\n<p>본문</p>`)은 평문으로 취급되어 태그가
+    이스케이프된다. HTML을 통과시키려면 태그로 시작하게 넘긴다.
     """
     if text is None:
         return None

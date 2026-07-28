@@ -12,7 +12,7 @@ argument-hint: "[path]"
 3. **추가 작업**이면 `AskUserQuestion`으로 반영 위치를 묻습니다:
    - ① 본문 append — `edit_task_description(task_id, mode='append_work', bullets=[...])`로 `[작업 내용]`에 블렛 추가(본문이 비어 있으면 `[작업 내용]` 라벨 블록을 신설).
    - ② 댓글 — `add_task_comment`에 `[추가 (YYYY-MM-DD)]` 라벨 + 블렛.
-   - ③ 하위 태스크 — `create_task(parent=task_id, ...)`.
+   - ③ 하위 태스크 — `create_task(parent=task_id, ...)`. 이때 description은 평문 한 문단으로 넣지 말고 `/gdc-task-new`의 **라벨 섹션 템플릿(평문)**을 따릅니다: `[요약]` 한두 줄 → (선택·짝) `[AS-IS]`/`[TO-BE]` → `[작업 내용]` 아래 `-` 블렛(각 한 줄). 체크박스·프로세스 메타 단계(빌드/검증/테스트/커밋/배포/버전 범프)는 제외합니다.
 4. **내용 변경**이면 `AskUserQuestion`으로 묻습니다:
    - ① 본문만 최신화 — `edit_task_description(task_id, mode='replace_section', label='<라벨>', new_body_html='<본문HTML>')`로 해당 라벨 섹션만 교체.
    - ② 댓글만 — `add_task_comment`에 `[변경 (YYYY-MM-DD)]` + 변경 이유 + 전/후(본문 유지).

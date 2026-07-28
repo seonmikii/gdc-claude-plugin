@@ -636,6 +636,26 @@ async def create_task(
        각 질문에 반드시 "건너뛰기" 포함(실제 값 최대 3개, 나머지는 "기타"로). 고른 값의 name(관련자는 user id)을 넘긴다.
     4) 담당자(assignee)는 묻지 않는다(생략 시 로그인 사용자로 자동 등록 = 작성자와 동일).
 
+    [description — 라벨 섹션 템플릿(평문)]
+    본문은 평문 한 문단으로 넣지 말고 아래 템플릿으로 작성해 넘긴다. 도구가 GDC 리치텍스트(HTML)로
+    변환한다(라벨→볼드 문단, `-`→목록, 섹션 사이 빈 문단).
+        [요약]
+        요청 내용 한두 줄 요약
+
+        [AS-IS]        ← 선택(TO-BE와 짝): 구현 전 상황이 실제로 드러날 때만
+        구현 전 상황
+
+        [TO-BE]        ← 선택(AS-IS와 짝)
+        구현 후 상황
+
+        [작업 내용]
+        - 실제 산출물 단계를 블렛(`-`)으로 한 줄씩
+    ※ [요약]·[작업 내용]=필수, [AS-IS]/[TO-BE]=선택(짝) — 전/후 상황이 불명확하면 생략(추측·빈말 금지).
+    ※ 체크박스 표시(`[ ]`/`[x]`)는 넣지 않는다(진행 상태는 progress 필드가 담당).
+    ※ 빌드·타입체크·검증·테스트·lint·커밋·배포·버전 범프·'INDEX.md 이력 추가' 같은
+      프로세스 메타 단계는 넣지 않는다(실제 산출물 단계만).
+    ※ 이미 HTML(태그로 시작)을 넘기면 변환 없이 그대로 저장된다.
+
     값 형식: status/priority/task_type은 해당 프로젝트 enum의 'name', 날짜는 'YYYY-MM-DD'.
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
 
@@ -745,6 +765,14 @@ async def update_task(
     clear_fields: list[str] | None = None,
 ) -> dict:
     """태스크를 부분 수정(PATCH)한다. 전달한 필드만 갱신된다.
+
+    [description — 라벨 섹션 템플릿(평문)]
+    본문을 교체할 때는 평문 한 문단이 아니라 `create_task`와 동일한 라벨 섹션 템플릿으로 넘긴다:
+    `[요약]`(필수) → 선택·짝인 `[AS-IS]`/`[TO-BE]` → `[작업 내용]`(필수, `-` 블렛 한 줄씩).
+    도구가 GDC 리치텍스트(HTML)로 변환한다(이미 태그로 시작하는 HTML이면 그대로 통과).
+    체크박스(`[ ]`/`[x]`)와 빌드·검증·테스트·커밋·배포·버전 범프 같은 프로세스 메타 단계는 넣지 않는다.
+    ※ 이 도구는 본문을 **통째로 교체**한다 — 일부 섹션만 고치거나 블렛만 덧붙일 때는
+      `edit_task_description`(replace_section/append_work)을 써서 인라인 이미지 유실을 막는다.
 
     사용자가 수정 권한을 가진 모든 편집 필드를 노출한다(읽기전용 id/number/creator 제외).
     status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인),
@@ -1118,6 +1146,9 @@ def sync_doc_progress(doc_path: str, task_id: int | None = None, description: st
     최초 진행 시 '진행'+실제 시작일, 100% 시 '완료'+실제 종료일로 자동 전이된다.
     description 전달 시 진행률 PATCH에 태스크 본문(description)도 함께 반영한다 —
     문서 본문이 수정됐을 때 호출 에이전트가 '[작업 내용]' 요약을 재생성해 넘기는 용도(자동 훅은 진행률 전용).
+    이때 본문은 `create_task`와 동일한 **라벨 섹션 템플릿(평문)** 으로 넘긴다 — `[요약]`(필수) →
+    선택·짝인 `[AS-IS]`/`[TO-BE]` → `[작업 내용]`(필수, `-` 블렛). 도구가 GDC 리치텍스트(HTML)로
+    변환하며(태그로 시작하는 HTML은 그대로 통과), 체크박스·프로세스 메타 단계는 넣지 않는다.
     """
     text = Path(doc_path).read_text(encoding="utf-8")
     if task_id is None:
@@ -1911,7 +1942,9 @@ def _apply_steps(include_fetch: bool = True, prefix: str = "") -> str:
         "   ① 본문 append — `edit_task_description(task_id, mode='append_work', bullets=[...])`로 `[작업 내용]`에 블렛 추가"
         "(본문이 비어 있으면 `[작업 내용]` 라벨 블록을 신설).\n"
         "   ② 댓글 — `add_task_comment`에 `[추가 (YYYY-MM-DD)]` 라벨 + 블렛.\n"
-        "   ③ 하위 태스크 — `create_task(parent=task_id, ...)`.",
+        "   ③ 하위 태스크 — `create_task(parent=task_id, ...)`. 이때 description은 평문 한 문단으로 넣지 말고 "
+        "`gdc_task_new`의 **라벨 섹션 템플릿(평문)**을 따릅니다: `[요약]` 한두 줄 → (선택·짝) `[AS-IS]`/`[TO-BE]` → "
+        "`[작업 내용]` 아래 `-` 블렛(각 한 줄). 체크박스·프로세스 메타 단계(빌드/검증/테스트/커밋/배포/버전 범프)는 제외합니다.",
         "**내용 변경**이면 AskUserQuestion으로 묻습니다:\n"
         "   ① 본문만 최신화 — `edit_task_description(task_id, mode='replace_section', label='<라벨>', "
         "new_body_html='<본문HTML>')`로 해당 라벨 섹션만 교체.\n"
