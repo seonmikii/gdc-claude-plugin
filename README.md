@@ -133,6 +133,7 @@ Claude Desktop은 **플러그인/마켓플레이스/슬래시 커맨드/훅을 �
 | `get_project_enums` | 프로젝트별 status/priority/task_type/members(담당자·관련자 후보) |
 | `list_my_tasks` | 내(담당/작성/참여) 미해결 태스크 — `not_finished`/`overdue`/`undated` |
 | `list_tasks` | 특정 담당자(이름 또는 id)의 태스크 — 동일 필터 |
+| `search_tasks` | 현재 프로젝트 키워드·다중 필터 검색(상태/우선순위/유형/담당자/관련자/고객사/종료일 범위). 완료 태스크도 기본 포함, 결과는 번호 내림차순(관련도순 아님) |
 | `create_task` | 태스크 생성(담당자 기본=본인, 날짜·멤버 입력 검증, 완료 상태면 진행률·실제 종료일 자동 보정). 본문은 라벨 섹션 템플릿(평문)으로 넘기면 GDC 리치텍스트(HTML)로 변환 |
 | `update_task` | 태스크 부분 수정(날짜 순서·미래·멤버 검증). 본문은 같은 라벨 섹션 템플릿 — 통째 교체이므로 부분 수정은 `edit_task_description` 사용 |
 | `edit_task_description` | 태스크 본문 최소 편집 — `append_work`(블렛 추가)·`replace_section`(라벨 섹션만 교체, 인라인 이미지 보존) |

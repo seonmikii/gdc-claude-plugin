@@ -320,8 +320,12 @@ def get_project_enums(project_id: int) -> dict:
     }
 
 
-def _not_finished_names(project_id: int) -> list[str]:
-    p = client.get(f"/api/projects/{project_id}/").json()
+def _not_finished_names(project_id: int, project: dict | None = None) -> list[str]:
+    """프로젝트의 미완료(category != 'done') 상태 이름 목록.
+
+    project에 프로젝트 상세 응답을 넘기면 재조회 없이 재사용한다.
+    """
+    p = project if project is not None else client.get(f"/api/projects/{project_id}/").json()
     return [s["name"] for s in p.get("task_statuses", []) if s.get("category") != "done"]
 
 
@@ -604,6 +608,188 @@ async def _resolve_task(
         f"제목 '{title}'이(가) 하나로 특정되지 않습니다. 후보: {listing} "
         f"— 제목을 더 정확히 쓰거나 태스크 id로 지정하세요."
     )
+
+
+# --- 태스크 검색 ---------------------------------------------------------------
+
+# 서버 TaskViewSet.ordering_fields(gdc-service backend/tasks/views.py)와 동일해야 한다.
+# 서버는 미허용 값을 조용히 무시하므로, 오타를 여기서 잡아 사용자에게 알린다.
+_ORDERING_FIELDS = {
+    "created_at", "updated_at", "planned_start_date", "planned_end_date",
+    "actual_start_date", "actual_end_date", "priority", "status",
+    "number", "title", "progress",
+}
+
+# undated는 서버 필터가 없어 클라이언트에서 거른다 → 넉넉히 선취(서버 max_page_size와 동일).
+_SEARCH_MAX_PAGE_SIZE = 200
+
+
+def _search_params(
+    project_id: int,
+    query: str | None = None,
+    status: list[str] | None = None,
+    priority: list[str] | None = None,
+    task_type: list[str] | None = None,
+    assignee_id: int | None = None,
+    participant_ids: list[int] | None = None,
+    customer_id: int | None = None,
+    planned_end_from: str | None = None,
+    planned_end_to: str | None = None,
+    root_only: bool = False,
+    not_finished_names: list[str] | None = None,
+    overdue: bool = False,
+    undated: bool = False,
+    ordering: str | None = None,
+    limit: int = 20,
+) -> dict[str, str | int]:
+    """search_tasks의 서버 질의 파라미터를 조립한다(네트워크 없음 — 단위 테스트 대상).
+
+    멤버·고객사 이름 해석은 호출부에서 끝내고 여기엔 id와 상태 이름만 넘긴다.
+    - 리스트 필터(status/priority/task_type/participant)는 서버의 CSV `BaseInFilter` 형식으로 변환.
+    - status를 명시하면 not_finished_names보다 우선한다.
+    - overdue는 `planned_end_date_to=어제`로 서버에서 처리(planned_end_to와 함께 주면 더 이른 쪽).
+    - undated는 서버 필터가 없어 page_size를 최대로 올려 선취한 뒤 호출부에서 거른다.
+    """
+    if query and root_only:
+        raise ValueError(
+            "query와 root_only는 함께 쓸 수 없습니다. 서버 검색은 매칭된 하위 태스크를 "
+            "그대로 반환하므로 root_only가 이를 걸러내 결과가 누락됩니다. "
+            "키워드 검색은 root_only=False로 하세요."
+        )
+    if ordering and ordering.lstrip("-") not in _ORDERING_FIELDS:
+        raise ValueError(
+            f"정렬 기준 '{ordering}'은(는) 지원하지 않습니다. "
+            f"가능한 값: {', '.join(sorted(_ORDERING_FIELDS))} (내림차순은 앞에 '-')"
+        )
+    for label, value in (("종료일 시작(planned_end_from)", planned_end_from),
+                         ("종료일 끝(planned_end_to)", planned_end_to)):
+        if value:
+            _parse_date(value, label)
+    if planned_end_from and planned_end_to and planned_end_from > planned_end_to:
+        raise ValueError(
+            f"planned_end_from({planned_end_from})은 planned_end_to({planned_end_to})보다 늦을 수 없습니다."
+        )
+
+    params: dict[str, str | int] = {
+        "project": project_id,
+        "page_size": _SEARCH_MAX_PAGE_SIZE if undated else min(limit, _SEARCH_MAX_PAGE_SIZE),
+    }
+    if query:
+        params["search"] = query
+    if status:
+        params["status"] = ",".join(status)
+    elif not_finished_names:
+        params["status"] = ",".join(not_finished_names)
+    if priority:
+        params["priority"] = ",".join(priority)
+    if task_type:
+        params["task_type"] = ",".join(task_type)
+    if assignee_id is not None:
+        params["assignee"] = assignee_id
+    if participant_ids:
+        params["participant"] = ",".join(str(p) for p in participant_ids)
+    if customer_id is not None:
+        params["customer"] = customer_id
+    if planned_end_from:
+        params["planned_end_date_from"] = planned_end_from
+    end_to = planned_end_to
+    if overdue:
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        end_to = min(end_to, yesterday) if end_to else yesterday
+    if end_to:
+        params["planned_end_date_to"] = end_to
+    if root_only:
+        params["root_only"] = "true"
+    if ordering:
+        params["ordering"] = ordering
+    return params
+
+
+@mcp.tool
+async def search_tasks(
+    ctx: Context,
+    query: str | None = None,
+    status: list[str] | None = None,
+    priority: list[str] | None = None,
+    task_type: list[str] | None = None,
+    assignee: int | str | None = None,
+    participant: list[int | str] | None = None,
+    customer: int | str | None = None,
+    planned_end_from: str | None = None,
+    planned_end_to: str | None = None,
+    root_only: bool = False,
+    not_finished: bool = False,
+    overdue: bool = False,
+    undated: bool = False,
+    ordering: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """현재 레포 프로젝트에서 키워드·필터로 태스크를 검색한다.
+
+    조회 범위는 **현재 레포에서 gdc_login/set_context로 선택한 프로젝트**로 고정된다(미설정 시 오류).
+    "내 태스크"는 list_my_tasks, "특정 담당자 태스크"는 list_tasks가 더 간단하다 —
+    이 도구는 키워드나 여러 조건을 조합할 때 쓴다.
+
+    - query: 제목·본문·댓글(멘션) 통합 검색어. **생략 가능**(필터만으로도 조회된다).
+      주의: 서버가 결과를 번호 내림차순(고정 태스크 우선)으로 재정렬하므로 **관련도순이 아니다** —
+      매칭이 많으면 "가장 관련 있는 N건"이 아니라 "매칭 중 최신 N건"이 온다. 응답의
+      total_matched로 전체 매칭 수를 확인하고, 필요하면 필터를 좁히거나 limit을 올린다.
+    - query는 root_only와 함께 쓸 수 없다(검색이 매칭한 하위 태스크가 통째로 걸러진다).
+    - status/priority/task_type: 상태·우선순위·유형 이름 목록(합집합). 값은 get_project_enums 참고.
+    - assignee/participant/customer: user id 또는 **멤버 이름**, 고객사 id 또는 **고객사 이름** 허용.
+    - planned_end_from/planned_end_to: 계획 종료일 범위(YYYY-MM-DD).
+    - not_finished: 완료(category=='done')가 아닌 상태만. status를 직접 주면 그 값이 우선한다.
+      **기본값은 False라 완료된 태스크도 함께 나온다**(끝난 태스크를 찾는 것도 검색의 목적이다).
+      list_my_tasks/list_tasks는 반대로 미해결만 보는 도구라 기본값이 True다 —
+      "미완료만" 검색하려면 not_finished=True를 명시해야 한다.
+    - overdue: 계획 종료일이 지난 것만(서버 필터). not_finished와 독립이다.
+    - undated: 계획 종료일이 없는 것만. 서버 필터가 없어 200건을 받아 거르므로,
+      200건을 넘는 프로젝트에서는 누락될 수 있다.
+    - ordering: number/title/status/priority/progress/created_at/updated_at/planned_*/actual_* 중 하나
+      (내림차순은 '-' 접두, 예: '-planned_end_date'). 생략 시 서버 기본(번호 내림차순).
+    - 응답: count(반환 건수)·total_matched(서버 전체 매칭 수)·tasks(요약 목록).
+    """
+    ctx_data = await _resolve_context(ctx)
+    project_id = ctx_data.get("project_id")
+    if project_id is None:
+        raise ValueError(
+            "프로젝트가 설정되지 않았습니다. gdc_login 또는 set_context로 프로젝트를 선택하세요."
+        )
+
+    # 멤버 해석과 미완료 상태 목록은 같은 프로젝트 상세를 쓰므로 한 번만 받아 재사용한다.
+    project = None
+    if assignee is not None or participant or not_finished:
+        project = client.get(f"/api/projects/{project_id}/").json()
+    assignee_id, participant_ids = _resolve_members(
+        project_id, assignee, participant, project=project
+    )
+    customer_id = (
+        _resolve_customer(ctx_data.get("workspace_id"), customer) if customer is not None else None
+    )
+
+    params = _search_params(
+        project_id,
+        query=query,
+        status=status,
+        priority=priority,
+        task_type=task_type,
+        assignee_id=assignee_id,
+        participant_ids=participant_ids,
+        customer_id=customer_id,
+        planned_end_from=planned_end_from,
+        planned_end_to=planned_end_to,
+        root_only=root_only,
+        not_finished_names=_not_finished_names(project_id, project=project) if not_finished else None,
+        overdue=overdue,
+        undated=undated,
+        ordering=ordering,
+        limit=limit,
+    )
+    data = client.get(_TASKS, params=params).json()
+    # overdue는 서버 필터로 처리했으므로 클라이언트 필터는 undated만 적용한다.
+    out = _finalize_task_list(data.get("results", []), False, undated, limit)
+    out["total_matched"] = data.get("count")
+    return out
 
 
 @mcp.tool
