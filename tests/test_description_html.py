@@ -273,6 +273,26 @@ def test_is_html_matches_normalize_passthrough_rule():
     assert is_html(None) is False
 
 
+def test_is_html_ignores_literal_tag_mid_sentence():
+    """문장 중간의 리터럴 태그는 HTML이 아니다 — 선두 앵커링(#417 재현)."""
+    assert is_html("현재 본문 선두에 평문 <p>@username</p>만 붙는다.") is False
+    assert is_html("[요약]\n프론트는 <span data-type=\"mention\">만 멘션으로 본다") is False
+
+
+def test_is_html_allows_leading_whitespace_before_tag():
+    """선행 공백·개행이 있어도 태그로 시작하면 HTML로 본다."""
+    assert is_html("\n  <p>본문</p>") is True
+
+
+def test_normalize_plaintext_with_literal_tag_is_converted_and_escaped():
+    """리터럴 태그가 섞인 평문도 변환된다 — 태그 문자열은 이스케이프되어 텍스트로 보존(#417)."""
+    out = normalize_description("[요약]\n평문 <p>@user</p>만 붙는다")
+    assert out == (
+        "<p><strong>요약</strong></p>"
+        "<p>평문 &lt;p&gt;@user&lt;/p&gt;만 붙는다</p>"
+    )
+
+
 def test_normalize_already_html_passthrough_unchanged():
     """이미 HTML이면 그대로 통과 — 이중 변환/이스케이프 방지."""
     html = "<p><strong>요약</strong></p><ul><li><p>항목</p></li></ul>"
