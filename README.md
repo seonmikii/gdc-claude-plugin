@@ -78,7 +78,7 @@ claude plugin update gdc-claude-plugin@gdc-marketplace
 | `/gdc-task-new` | 새 태스크 생성(선택 목록·한글·담당자 자동) |
 | `/gdc-task-from-doc <path>` | 작업 요청 문서로 태스크 생성 |
 | `/gdc-doc-from-task <task_id>` | 태스크로 작업 요청 문서 생성·연동 |
-| `/gdc-link-task <task_id> [doc]` | 기존 태스크를 기존 문서와 연동 |
+| `/gdc-link-task <task_id> [doc]` | 기존 태스크를 기존 문서와 연동 + 문서 내용 반영(선택) |
 | `/gdc-apply [path]` | 문서 변경을 태스크 본문/댓글/하위 태스크에 반영(분류→라우팅) |
 | `/gdc-sync [path]` | 문서 진행률을 연결된 태스크에 강제 동기화 |
 | `/gdc-update` | gdc-marketplace 갱신 후 플러그인 최신 버전으로 승격 |
