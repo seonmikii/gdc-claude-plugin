@@ -9,6 +9,7 @@ gdc-service REST API를 Claude Code의 MCP 도구로 노출한다. 인증은 브
 from __future__ import annotations
 
 import datetime
+import html
 import os
 import re
 from pathlib import Path
@@ -1347,15 +1348,20 @@ async def task_from_doc(
 # gdc-service의 댓글은 Mention 모델(/api/tasks/mentions/). content는 리치텍스트(HTML)이고,
 # 서버가 content의 `@username`을 파싱해 멘션 알림(task_commented)을 발송한다. 수정/삭제는
 # 작성자 본인만 가능(403). 이 레포는 클라이언트 — 서버는 미수정.
+#
+# 멘션은 프론트 에디터와 동일한 span 노드로 삽입한다 — 평문 `@username`도 알림은 가지만,
+# 프론트는 `span[data-type="mention"]`만 멘션으로 재인식해 강조(볼드+강조색) 렌더한다.
 
 
 def _resolve_mention_usernames(
     project_id: int,
     mentions: list[int | str] | None,
     project: dict | None = None,
-) -> list[str]:
-    """멘션 대상(멤버 이름 또는 user id)을 프로젝트 멤버의 username 리스트로 해석한다.
+) -> list[tuple[str, str]]:
+    """멘션 대상(멤버 이름 또는 user id)을 `(username, 표시이름)` 쌍 리스트로 해석한다.
 
+    표시이름은 멘션 span의 `data-label`(화면 표시용)로 쓰며, full_name이 비면 username으로
+    대체한다(프론트의 "label 없는 과거 데이터" 처리와 동일).
     비멤버는 _resolve_members와 동일하게 가능한 멤버 목록과 함께 ValueError로 안내한다.
     project에 프로젝트 상세 응답을 넘기면 재조회 없이 재사용한다.
     """
@@ -1364,44 +1370,65 @@ def _resolve_mention_usernames(
     if project is None:
         project = client.get(f"/api/projects/{project_id}/").json()
     members = project.get("members", [])
-    by_id: dict[int, str | None] = {}
-    by_name: dict[str, str | None] = {}
+    by_id: dict[int, tuple[str, str] | None] = {}
+    by_name: dict[str, tuple[str, str] | None] = {}
     for m in members:
         uname = m.get("username")
+        pair = (uname, str(m.get("full_name") or uname)) if uname else None
         if m.get("user") is not None:
-            by_id[m["user"]] = uname
+            by_id[m["user"]] = pair
         for nm in (m.get("full_name"), m.get("username")):
             if nm:
-                by_name[str(nm).strip().lower()] = uname
+                by_name[str(nm).strip().lower()] = pair
 
-    resolved: list[str] = []
+    resolved: list[tuple[str, str]] = []
     for value in mentions:
         if not isinstance(value, bool) and (isinstance(value, int) or str(value).strip().isdigit()):
-            uname = by_id.get(int(value))
+            pair = by_id.get(int(value))
         else:
-            uname = by_name.get(str(value).strip().lower())
-        if not uname:
+            pair = by_name.get(str(value).strip().lower())
+        if not pair:
             valid = ", ".join(
                 f"{(m.get('full_name') or m.get('username'))}(id={m.get('user')})" for m in members
             )
             raise ValueError(
                 f"멘션 대상 '{value}'은(는) 이 프로젝트의 멤버가 아닙니다. 가능한 멤버: {valid or '(없음)'}"
             )
-        resolved.append(uname)
+        resolved.append(pair)
     return resolved
 
 
-def _build_comment_html(content: str, usernames: list[str], resolve_task=None) -> str:
-    """본문을 GDC 리치텍스트(HTML)로 변환하고, 멘션이 있으면 `@user…` 문단을 선두에 붙인다.
+def _mention_span(username: str, label: str) -> str:
+    """프론트 에디터가 만드는 것과 동일한 멘션 span 노드를 만든다.
 
-    서버가 content의 `@username`을 파싱하므로, HTML 문단으로 감싸도 정규식이 사용자명을 찾는다.
-    resolve_task를 주면 본문의 `#N` 태스크 언급을 링크로 변환한다(#409 후속).
+    형태: `<span data-type="mention" class="mention" data-id="{username}" data-label="{표시이름}">@{username}</span>`
+    - `data-type="mention"`이 있어야 프론트(@tiptap/extension-mention)가 멘션으로 재인식하고,
+      `class="mention"`에 볼드+강조색 CSS가 걸린다. 표시는 `@data-label`, 저장 텍스트는 `@data-id`.
+    - 백엔드 알림 매칭은 원문 HTML에 `@([\\w.@+-]+)`를 적용하므로 span 내부 텍스트로 그대로 걸린다.
+    - **속성 순서 고정**: 웹훅 평문 변환(`backend/tasks/signals.py` `_tiptap_to_plain`)이
+      `data-type` → `data-label` 순서의 쌍따옴표 속성을 요구한다. 순서가 바뀌면 웹훅 본문이
+      `@표시이름` 대신 `@username`으로 열화된다.
     """
-    html = normalize_description(content, resolve_task=resolve_task) or ""
-    if usernames:
-        prefix = " ".join(f"@{u}" for u in usernames)
-        html = f"<p>{prefix}</p>{html}"
-    return html
+    uid = html.escape(username, quote=True)
+    return (
+        f'<span data-type="mention" class="mention" data-id="{uid}" '
+        f'data-label="{html.escape(label, quote=True)}">@{uid}</span>'
+    )
+
+
+def _build_comment_html(
+    content: str, mentions: list[tuple[str, str]], resolve_task=None
+) -> str:
+    """본문을 GDC 리치텍스트(HTML)로 변환하고, 멘션이 있으면 멘션 span 문단을 선두에 붙인다.
+
+    멘션 span은 인라인 노드이므로 반드시 `<p>` 문단으로 감싼다(최상위 bare span은 재편집 시
+    문단 구조가 어긋난다). resolve_task를 주면 본문의 `#N` 태스크 언급을 링크로 변환한다(#409 후속).
+    """
+    body = normalize_description(content, resolve_task=resolve_task) or ""
+    if mentions:
+        prefix = " ".join(_mention_span(u, label) for u, label in mentions)
+        body = f"<p>{prefix}</p>{body}"
+    return body
 
 
 @mcp.tool
@@ -1441,19 +1468,20 @@ def add_task_comment(
     """태스크에 댓글(멘션)을 작성한다. 필수: task_id, content(본문).
 
     content는 평문으로 넘기면 GDC 리치텍스트(HTML)로 변환해 저장한다(이미 HTML이면 통과).
-    mentions에 멤버 이름 또는 user id 리스트를 주면 각 멤버의 username으로 해석해
-    본문 맨 앞에 `@user1 @user2` 한 줄을 붙인다 → 서버가 이를 파싱해 멘션 알림을 발송한다.
+    mentions에 멤버 이름 또는 user id 리스트를 주면 각 멤버를 해석해 본문 맨 앞에
+    **하이라이트 멘션 한 줄**(GDC 에디터와 동일한 멘션 노드 — 화면에 볼드+강조색으로 표시)을
+    붙인다 → 서버가 이를 파싱해 멘션 알림을 발송한다.
     (멘션은 본문 선두에만 배치되며, 본문 중간 커서 위치 삽입은 지원하지 않는다.)
     비멤버를 멘션하면 가능한 멤버 목록과 함께 오류로 안내한다.
     """
-    usernames: list[str] = []
+    resolved_mentions: list[tuple[str, str]] = []
     resolve_task = None
     if mentions or _has_task_mentions(content):
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
         if mentions:
-            usernames = _resolve_mention_usernames(project_id, mentions)
+            resolved_mentions = _resolve_mention_usernames(project_id, mentions)
         resolve_task = _task_resolver(content, project_id)
-    content_html = _build_comment_html(content, usernames, resolve_task=resolve_task)
+    content_html = _build_comment_html(content, resolved_mentions, resolve_task=resolve_task)
     m = client.request(
         "POST", _MENTIONS, json={"task": task_id, "content": content_html}
     ).json()
@@ -1472,17 +1500,19 @@ def update_task_comment(
 
     주의: 서버가 새 content로 멘션을 **다시 파싱해 덮어쓴다**. 기존 멘션을 유지하려면
     mentions 인자로 함께 넘겨야 하며, mentions 없이 수정하면 이전 멘션 알림 대상이 사라진다.
+    mentions는 add_task_comment와 동일하게 본문 선두 하이라이트 멘션 한 줄로 삽입된다
+    (이미 멘션된 사용자에게 중복 알림은 가지 않는다 — 서버가 신규 멘션 델타만 발송).
     content는 평문→HTML 자동 변환(이미 HTML이면 통과).
     """
-    usernames: list[str] = []
+    resolved_mentions: list[tuple[str, str]] = []
     resolve_task = None
     if mentions or _has_task_mentions(content):
         task_id = client.get(f"{_MENTIONS}{comment_id}/").json().get("task")
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
         if mentions:
-            usernames = _resolve_mention_usernames(project_id, mentions)
+            resolved_mentions = _resolve_mention_usernames(project_id, mentions)
         resolve_task = _task_resolver(content, project_id)
-    content_html = _build_comment_html(content, usernames, resolve_task=resolve_task)
+    content_html = _build_comment_html(content, resolved_mentions, resolve_task=resolve_task)
     try:
         m = client.request(
             "PATCH", f"{_MENTIONS}{comment_id}/", json={"content": content_html}
