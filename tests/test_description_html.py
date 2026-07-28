@@ -5,7 +5,12 @@ GDC description은 리치텍스트(HTML)로 저장·렌더링되므로(실증 �
 평문을 그대로 보내면 본문이 뭉개진다 — 이 변환이 조용히 깨지면 태스크 본문이 깨진다.
 """
 
-from gdc_mcp.doc_utils import description_to_html, html_to_text, normalize_description
+from gdc_mcp.doc_utils import (
+    description_to_html,
+    html_to_text,
+    mention_numbers,
+    normalize_description,
+)
 
 
 def test_label_and_paragraph():
@@ -153,6 +158,96 @@ def test_comment_path_autolinks_via_normalize():
     assert out == (
         '<p>확인 <a target="_blank" rel="noopener noreferrer" '
         'href="https://example.com">https://example.com</a></p>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# 태스크 언급(#N) 자동 연동 — resolve_task 콜백 주입(서버 계층에서 client 백엔드)
+# ---------------------------------------------------------------------------
+
+def _resolver(mapping):
+    """번호→(url, title) 매핑을 흉내내는 순수 콜백(미해결은 None)."""
+    return lambda number: mapping.get(number)
+
+
+def test_mention_linked_with_title_in_parens():
+    """`#N`만 링크하고 바로 뒤에 `(제목)`을 평문으로 삽입한다."""
+    r = _resolver({409: ("https://gdc.gemiso.com/tasks/15434", "HTML 변환시 링크 연동")})
+    out = description_to_html("이슈 #409 참고", resolve_task=r)
+    assert out == (
+        '<p>이슈 <a target="_blank" rel="noopener noreferrer" '
+        'href="https://gdc.gemiso.com/tasks/15434">#409</a> (HTML 변환시 링크 연동) 참고</p>'
+    )
+
+
+def test_mention_unresolved_number_stays_plaintext():
+    """현재 프로젝트에 없는 번호(resolver None)는 평문 `#N`으로 둔다."""
+    r = _resolver({})
+    out = description_to_html("- 없는 #999 링크 안됨", resolve_task=r)
+    assert out == "<ul><li><p>없는 #999 링크 안됨</p></li></ul>"
+
+
+def test_mention_without_resolver_is_plaintext():
+    """resolver 미주입(None)이면 `#N`은 손대지 않는다(하위 호환) — URL만 연동."""
+    out = description_to_html("보류 #409 이지만 https://example.com 는 링크")
+    assert out == (
+        '<p>보류 #409 이지만 <a target="_blank" rel="noopener noreferrer" '
+        'href="https://example.com">https://example.com</a> 는 링크</p>'
+    )
+
+
+def test_mention_boundary_no_false_positive():
+    """색상 `#fff`·단어 뒤 `v1#2`는 태스크 언급이 아니다."""
+    r = _resolver({2: ("https://x/2", "T2"), 3: ("https://x/3", "T3")})
+    out = description_to_html("색상 #fff 와 버전 v1#2", resolve_task=r)
+    assert out == "<p>색상 #fff 와 버전 v1#2</p>"
+
+
+def test_mention_inside_url_not_double_linked():
+    """URL 프래그먼트(`...#409`)는 URL로만 링크되고 별도 언급 처리 안 함."""
+    r = _resolver({409: ("https://gdc.gemiso.com/tasks/15434", "제목")})
+    out = description_to_html("- https://gdc.gemiso.com/tasks/15434#409", resolve_task=r)
+    assert out == (
+        "<ul><li><p>"
+        '<a target="_blank" rel="noopener noreferrer" '
+        'href="https://gdc.gemiso.com/tasks/15434#409">https://gdc.gemiso.com/tasks/15434#409</a>'
+        "</p></li></ul>"
+    )
+
+
+def test_mention_title_is_escaped():
+    """제목의 `<`·`&`는 평문 삽입 시 이스케이프."""
+    r = _resolver({7: ("https://x/7", "a<b & c")})
+    out = description_to_html("보라 #7", resolve_task=r)
+    assert out == (
+        '<p>보라 <a target="_blank" rel="noopener noreferrer" '
+        'href="https://x/7">#7</a> (a&lt;b &amp; c)</p>'
+    )
+
+
+def test_mention_repeated_both_linked():
+    """같은 번호가 여러 번 나와도 모두 링크된다."""
+    r = _resolver({5: ("https://x/5", "다섯")})
+    out = description_to_html("#5 와 또 #5", resolve_task=r)
+    assert out == (
+        '<p><a target="_blank" rel="noopener noreferrer" href="https://x/5">#5</a> (다섯) '
+        '와 또 <a target="_blank" rel="noopener noreferrer" href="https://x/5">#5</a> (다섯)</p>'
+    )
+
+
+def test_mention_numbers_dedup_and_boundary():
+    """번호 추출은 디둡하고 경계 규칙(색상/단어 뒤)을 지킨다."""
+    assert mention_numbers("이슈 #409 와 #409 또 #5, 색상 #fff, v1#2") == {409, 5}
+    assert mention_numbers("") == set()
+
+
+def test_normalize_description_threads_resolver():
+    """normalize_description도 resolver를 아래로 전달한다(댓글·본문 공통 경로)."""
+    r = _resolver({409: ("https://gdc.gemiso.com/tasks/15434", "제목")})
+    out = normalize_description("확인 #409", resolve_task=r)
+    assert out == (
+        '<p>확인 <a target="_blank" rel="noopener noreferrer" '
+        'href="https://gdc.gemiso.com/tasks/15434">#409</a> (제목)</p>'
     )
 
 

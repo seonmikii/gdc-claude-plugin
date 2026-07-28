@@ -11,6 +11,10 @@ from __future__ import annotations
 import html
 import re
 from pathlib import Path
+from typing import Callable
+
+# 태스크 언급 resolver: 번호 → (url, title). 미해결이면 None(평문 유지). (#409 후속)
+TaskResolver = Callable[[int], "tuple[str, str] | None"]
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _PHASE_HEADING_RE = re.compile(r"^#{2,4}\s*(?:Phase|단계)\b.*$", re.IGNORECASE)
@@ -22,19 +26,59 @@ _BULLET_RE = re.compile(r"^\s*[-*]\s+(.+)$")
 _URL_RE = re.compile(r"""https?://[^\s<>"']+""")
 # URL 끝에 붙는 문장부호는 링크에서 제외(예: "...example.com." 의 마침표).
 _URL_TRAILING = ".,;:!?)]}"
+# 태스크 언급(#N): 앞이 영숫자·`_`·`#`가 아니고(단어 경계) 뒤가 숫자 경계. (#409 후속)
+# `이슈 #409`·`(#409)` O / `#fff`(색상)·`v1#2`(앞이 단어)·마크다운 `# 제목`(뒤 공백) X.
+_MENTION_RE = re.compile(r"(?<![\w#])#(\d+)\b")
 
 
-def _escape_and_linkify(text: str) -> str:
-    """평문을 이스케이프하되 http/https 맨 URL은 `<a>` 링크로 감싼다(#409).
+def mention_numbers(text: str) -> set[int]:
+    """평문에서 태스크 언급(`#N`)의 번호 집합을 추출한다(디둡).
 
-    비-URL 구간은 `html.escape`로 그대로 이스케이프하고, URL 구간만 GDC 리치텍스트가
+    서버 계층이 번호→(url, title) resolver를 만들기 전에 조회 대상 번호를 모으는 용도.
+    """
+    return {int(m.group(1)) for m in _MENTION_RE.finditer(text or "")}
+
+
+def _escape_mentions(text: str, resolve_task: TaskResolver | None) -> str:
+    """비-URL 텍스트를 이스케이프하되, resolver가 있으면 `#N` 태스크 언급을 링크로 만든다.
+
+    resolve_task(number)가 (url, title)를 주면 `<a>#N</a> (title)`, None이면 평문 `#N` 유지.
+    resolve_task 자체가 None이면(문서/순수 경로) 언급을 손대지 않는다(하위 호환).
+    """
+    if resolve_task is None:
+        return html.escape(text, quote=False)
+    out: list[str] = []
+    last = 0
+    for m in _MENTION_RE.finditer(text):
+        out.append(html.escape(text[last : m.start()], quote=False))
+        resolved = resolve_task(int(m.group(1)))
+        if resolved is None:
+            out.append(html.escape(m.group(0), quote=False))  # 미해결 → 평문 #N
+        else:
+            url, title = resolved
+            eurl = html.escape(url, quote=False)
+            out.append(
+                f'<a target="_blank" rel="noopener noreferrer" href="{eurl}">#{m.group(1)}</a>'
+            )
+            if title:
+                out.append(f" ({html.escape(title, quote=False)})")
+        last = m.end()
+    out.append(html.escape(text[last:], quote=False))
+    return "".join(out)
+
+
+def _escape_and_linkify(text: str, resolve_task: TaskResolver | None = None) -> str:
+    """평문을 이스케이프하되 http/https 맨 URL과 `#N` 태스크 언급을 링크로 만든다(#409).
+
+    비-URL 구간은 `_escape_mentions`로 이스케이프(+언급 링크)하고, URL 구간만 GDC 리치텍스트가
     지원하는 `<a target="_blank" rel="noopener noreferrer" href="...">`로 만든다(실증: 태스크 #292).
-    URL 뒤 문장부호(마침표·쉼표·닫는 괄호 등)는 링크에 포함하지 않는다.
+    URL 뒤 문장부호(마침표·쉼표·닫는 괄호 등)는 링크에 포함하지 않는다. URL 구간을 먼저 소비하므로
+    URL 내부 프래그먼트(`...#409`)는 언급으로 오처리되지 않는다.
     """
     out: list[str] = []
     last = 0
     for m in _URL_RE.finditer(text):
-        out.append(html.escape(text[last : m.start()], quote=False))
+        out.append(_escape_mentions(text[last : m.start()], resolve_task))
         url = m.group(0)
         trailing_len = 0
         while url and url[-1] in _URL_TRAILING:
@@ -45,7 +89,7 @@ def _escape_and_linkify(text: str) -> str:
             f'<a target="_blank" rel="noopener noreferrer" href="{esc}">{esc}</a>'
         )
         last = m.end() - trailing_len
-    out.append(html.escape(text[last:], quote=False))
+    out.append(_escape_mentions(text[last:], resolve_task))
     return "".join(out)
 
 
@@ -56,7 +100,9 @@ _HTML_TAG_RE = re.compile(
 )
 
 
-def normalize_description(text: str | None) -> str | None:
+def normalize_description(
+    text: str | None, resolve_task: TaskResolver | None = None
+) -> str | None:
     """태스크 description을 GDC 리치텍스트(HTML)로 정규화한다(생성/수정/동기화 공통 진입점).
 
     GDC는 description을 모든 경로에서 HTML로 저장·렌더링하므로, 평문을 그대로 보내면 줄바꿈이
@@ -74,10 +120,10 @@ def normalize_description(text: str | None) -> str | None:
         return None
     if _HTML_TAG_RE.search(text):
         return text  # 이미 HTML — 통과
-    return description_to_html(text)
+    return description_to_html(text, resolve_task=resolve_task)
 
 
-def description_to_html(text: str) -> str:
+def description_to_html(text: str, resolve_task: TaskResolver | None = None) -> str:
     """라벨 섹션 템플릿(평문)을 GDC 리치텍스트(HTML)로 변환한다.
 
     GDC의 description은 리치텍스트 에디터(HTML)로 저장·렌더링되므로(실증 확인: 태스크
@@ -115,7 +161,7 @@ def description_to_html(text: str) -> str:
         for line in sec:
             mb = _BULLET_RE.match(line)
             if mb:
-                bullets.append(_escape_and_linkify(mb.group(1).strip()))
+                bullets.append(_escape_and_linkify(mb.group(1).strip(), resolve_task))
                 continue
             if bullets:  # 블렛이 아닌 줄을 만나면 열린 <ul>을 닫는다
                 parts.append(_ul(bullets))
@@ -126,7 +172,7 @@ def description_to_html(text: str) -> str:
                 label = html.escape(ml.group(1).strip(), quote=False)
                 parts.append(f"<p><strong>{label}</strong></p>")
             else:
-                parts.append(f"<p>{_escape_and_linkify(stripped)}</p>")
+                parts.append(f"<p>{_escape_and_linkify(stripped, resolve_task)}</p>")
         if bullets:
             parts.append(_ul(bullets))
         html_sections.append("".join(parts))
