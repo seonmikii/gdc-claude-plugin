@@ -2009,6 +2009,164 @@ async def list_trashed_tasks(ctx: Context, limit: int = 20) -> dict:
     }
 
 
+# --- 알림·멘션 조회 -------------------------------------------------------------
+# 조회 전용이다. 읽음 처리(mark_read/read-all)는 노출하지 않는다 — 에이전트가 사용자의
+# 웹 UI 읽음 상태를 바꾸지 않게 한다.
+
+_NOTIFICATIONS = "/api/notifications/"
+_DASHBOARD_MENTIONS = "/api/dashboard/mentions/"
+
+# 서버 NotificationPagination의 max_page_size.
+_NOTIFICATION_MAX_PAGE_SIZE = 99
+# /api/dashboard/mentions/는 pagination_class를 두지 않아 DRF 전역 PAGE_SIZE(20)로 고정되고
+# page_size 쿼리 파라미터를 받지 않는다 → limit을 채우려면 page를 넘겨가며 모은다.
+_MENTION_LIST_PAGE_SIZE = 20
+_MENTION_LIST_MAX_PAGES = 10
+
+_NOTIFICATION_LABELS = {
+    "mention": "멘션", "description_mention": "설명 멘션",
+    "assignee_change": "담당자 변경", "task_comment": "태스크 댓글",
+    "participant_added": "관련자 추가", "task_status_changed": "태스크 상태 변경",
+    "task_updated": "태스크 수정",
+}
+
+_DANGLING_TAG_RE = re.compile(r"<[^>]*$")
+
+
+def _mention_preview(raw: str | None, limit: int = 100) -> str:
+    """멘션 미리보기(서버가 HTML을 자른 100자 조각)를 평문으로 정리한다.
+
+    서버는 content_preview를 `mention.content[:100]`로 만들어 HTML 태그가 그대로 남고
+    끝이 태그 중간에서 잘리기도 한다(알림 쪽 serializer와 달리 strip_tags를 하지 않는다).
+    잘린 꼬리 태그를 먼저 버리고 평문화한 뒤 다시 limit자로 맞춘다.
+    """
+    if not raw:
+        return ""
+    text = html_to_text(_DANGLING_TAG_RE.sub("", raw))
+    text = " ".join(text.split())
+    return text[:limit]
+
+
+@mcp.tool
+def list_my_notifications(unread_only: bool = False, limit: int = 20) -> dict:
+    """내 알림 목록을 조회한다(조회 전용 — 읽음 처리는 하지 않는다).
+
+    멘션·담당자 변경·댓글·상태 변경 등 나를 수신자로 하는 알림을 최신순으로 반환하고,
+    미읽음 총 개수(unread_count)를 함께 준다.
+    - unread_only=True면 읽지 않은 알림만 조회한다.
+    - limit은 최대 99(서버 상한). 그보다 많이 요청해도 99로 자른다.
+    - **워크스페이스/프로젝트 스코프가 없다** — 서버가 수신자 기준으로만 거르므로 다른
+      워크스페이스의 알림이 섞여 온다. 항목의 project_name으로 구분한다.
+    - 각 항목의 url로 get_task/open_task를 이어서 호출할 수 있다.
+    """
+    params: dict[str, str | int] = {"page_size": min(limit, _NOTIFICATION_MAX_PAGE_SIZE)}
+    if unread_only:
+        params["is_read"] = "false"
+    data = client.get(_NOTIFICATIONS, params=params).json()
+    unread = client.get(f"{_NOTIFICATIONS}unread-count/").json().get("count")
+    items = data.get("results", [])[:limit]
+    return {
+        "count": len(items),
+        "total": data.get("count"),
+        "unread_count": unread,
+        "notifications": [
+            {
+                "id": n.get("id"),
+                "type": n.get("notification_type"),
+                "type_label": _NOTIFICATION_LABELS.get(
+                    n.get("notification_type"), n.get("notification_type")
+                ),
+                "title": n.get("title"),
+                "preview": n.get("content_preview"),
+                "sender_name": n.get("sender_name"),
+                "is_read": n.get("is_read"),
+                "task_id": n.get("related_task"),
+                "task_number": n.get("task_number"),
+                "task_title": n.get("task_title"),
+                "project_name": n.get("project_name"),
+                "created_at": n.get("created_at"),
+                "url": _task_url(n["related_task"]) if n.get("related_task") else None,
+            }
+            for n in items
+        ],
+    }
+
+
+@mcp.tool
+async def list_my_mentions(
+    ctx: Context,
+    mention_type: str = "both",
+    project_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    search: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """나와 관련된 댓글 멘션 목록을 최신순으로 조회한다(조회 전용).
+
+    알림(list_my_notifications)과 달리 **댓글 본문**을 훑는 용도다 — 어떤 태스크에서 무슨
+    이야기가 오갔는지 확인할 때 쓴다.
+    - mention_type: 'mentioned'(나를 언급한 것)/'authored'(내가 쓴 것)/'both'(기본).
+    - 스코프: 현재 레포 컨텍스트의 워크스페이스 + 프로젝트를 기본 적용한다. project_id를
+      직접 주면 그 프로젝트로 바꿔 조회한다.
+    - date_from/date_to: 작성일 범위(YYYY-MM-DD). search: 댓글 본문 부분 일치.
+    - preview는 서버가 100자로 자른 조각을 평문화한 값이라 문장이 중간에서 끊길 수 있다.
+      전체 내용은 url이나 list_task_comments(task_id)로 확인한다.
+    """
+    if mention_type not in ("mentioned", "authored", "both"):
+        raise ValueError(
+            f"mention_type은 'mentioned'/'authored'/'both' 중 하나여야 합니다: {mention_type!r}"
+        )
+    for label, value in (("date_from", date_from), ("date_to", date_to)):
+        if value:
+            _parse_date(value, label)
+
+    ctx_data = await _resolve_context(ctx)
+    params: dict[str, str | int] = {"mention_type": mention_type}
+    if ctx_data.get("workspace_id") is not None:
+        params["workspace"] = ctx_data["workspace_id"]
+    scope_project = project_id if project_id is not None else ctx_data.get("project_id")
+    if scope_project is not None:
+        params["project_id"] = scope_project
+    if date_from:
+        params["date_from"] = date_from
+    if date_to:
+        params["date_to"] = date_to
+    if search:
+        params["search"] = search
+
+    # 서버가 20건 페이지로 고정이라 limit을 채울 때까지 page를 넘긴다.
+    items: list[dict] = []
+    total = None
+    for page in range(1, _MENTION_LIST_MAX_PAGES + 1):
+        data = client.get(_DASHBOARD_MENTIONS, params={**params, "page": page}).json()
+        total = data.get("count")
+        items.extend(data.get("results", []))
+        if len(items) >= limit or not data.get("next"):
+            break
+    items = items[:limit]
+
+    return {
+        "count": len(items),
+        "total": total,
+        "project_id": scope_project,
+        "mentions": [
+            {
+                "id": m.get("id"),
+                "author_name": m.get("author_name"),
+                "task_id": m.get("task_id"),
+                "task_number": m.get("task_number"),
+                "task_title": m.get("task_title"),
+                "project_name": m.get("project_name"),
+                "preview": _mention_preview(m.get("content_preview")),
+                "created_at": m.get("created_at"),
+                "url": _task_url(m["task_id"]) if m.get("task_id") else None,
+            }
+            for m in items
+        ],
+    }
+
+
 # --- 프롬프트(슬래시 커맨드) — Claude Desktop·Code 양쪽에서 사용 -------------------
 # Claude Code에서는 /mcp__gdc-local__gdc_* 로, Desktop에서는 "+" 메뉴로 노출된다.
 

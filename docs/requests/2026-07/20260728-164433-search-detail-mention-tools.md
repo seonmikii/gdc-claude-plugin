@@ -5,7 +5,7 @@
 | 유형 | feat |
 | 영역 | server/gdc_mcp |
 | 날짜 | 2026-07-28 |
-| 상태 | partial |
+| 상태 | done |
 | 관련 | server, client |
 
 ## 요청 내용
@@ -126,15 +126,19 @@ MCP 기능 검토에서 도출한 후보 중 3건을 한 묶음으로 처리한�
 
 ### Phase 3 — 알림·멘션 조회 도구 추가
 
-- [ ] 알림 유형 한글 라벨 매핑 + `list_my_notifications` 구현(미읽음 필터, `unread_count` 동봉)
-- [ ] `list_my_mentions` 구현(현재 레포 컨텍스트 기본 적용, `mention_type`/기간/검색, **20건 고정 페이지 순회 + 미리보기 HTML 제거 후 100자 재가공**)
-- [ ] 두 도구 docstring — 알림은 전 워크스페이스 혼재, 멘션은 컨텍스트 스코프, 읽음 처리 미지원 명시
+- [x] 알림 유형 한글 라벨 매핑(7종) + `list_my_notifications` 구현 — `unread_only` 필터, `page_size` 상한 99, `/unread-count/` 1회 추가 호출로 `unread_count` 동봉, 항목마다 태스크 url
+- [x] `list_my_mentions` 구현 — 컨텍스트 워크스페이스/프로젝트 기본 적용(`project_id`로 override), `mention_type`/기간/검색 검증, **20건 고정 페이지 순회**(최대 10페이지), 미리보기는 `_mention_preview`로 잘린 꼬리 태그 제거 후 평문화·100자 재가공
+- [x] 두 도구 docstring — 알림은 전 워크스페이스 혼재, 멘션은 컨텍스트 스코프, 둘 다 읽음 처리 미지원 명시
+- [x] `tests/test_mentions.py` 16건 추가 — 미리보기 정리 9건(꼬리 태그·엔티티·길이 상한), 목록 도구 7건(단일/다중 페이지 순회, `next` 없으면 중단, `page_size` 미전송, 컨텍스트 스코프·override, 입력 검증)
+- [x] 로컬 사전 검증(Phase 3분) — **읽기 전용** 실호출: `list_my_notifications` 40건 중 3건 반환·`unread_count` 0·라벨 매핑(`task_comment`→"태스크 댓글") 확인, 전 워크스페이스 혼재(GDC-Support·GSAM) 실제 확인. `list_my_mentions`는 저장 컨텍스트를 건드리지 않고 WS3/45로 대체 호출해 3건 조회·미리보기 평문화 확인. 데이터 생성·변경 없음
+- [x] `uv run python -m pytest tests/` 167건 통과(신규 16건 포함, 회귀 0)
 
 ### Phase 4 — 검증·배포
 
-- [ ] `uv run python -m pytest tests/` 전체 통과(회귀 0)
-- [ ] 로컬 사전 검증 — WS3 / 45 이슈관리에서 세 도구 실제 호출, 임시 데이터 삭제·컨텍스트 원복
-- [ ] `plugin.json` 버전 범프(v0.7.0) + `README.md` 도구표 갱신 + `docs/INDEX.md` 이력 추가
+- [x] `uv run python -m pytest tests/` 전체 통과 — 167건(신규 50건: 검색 25 + 캐시 9 + 멘션 16), 회귀 0
+- [x] 로컬 사전 검증 — WS3 / 45 이슈관리에서 네 도구 실제 호출(Phase별 기록 참조). 임시 데이터(관련자·임시 태그·본문·고정) 전량 원복, 잔존 0. 저장 컨텍스트는 WS6/16 그대로(변경 없음)
+- [x] `plugin.json` 버전 범프(0.6.4 → **0.7.0**) + `README.md` 도구표 갱신(`search_tasks`·`list_my_notifications`·`list_my_mentions` 추가, `get_task` 설명 보강) + `docs/INDEX.md` 이력 추가
+- [x] GDC 태스크 등록 — 상위 #292 아래 하위 3건 생성([#419](https://gdc.gemiso.com/tasks/15508)/[#420](https://gdc.gemiso.com/tasks/15509)/[#421](https://gdc.gemiso.com/tasks/15510))
 
 ## 참고 사항
 
