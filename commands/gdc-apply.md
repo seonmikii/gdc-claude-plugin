@@ -10,7 +10,7 @@ argument-hint: "[path]"
 1. 문서 frontmatter의 `task_id` 확인(없으면 `/gdc-link-task`·`/gdc-login` 안내). `get_task`로 현재 본문(description)을 가져옵니다.
 2. 문서(요청 내용 / `## 작업 결과`)와 현재 본문을 비교해 **추가 작업**인지 **기존 내용 변경**인지 분류합니다.
 3. **추가 작업**이면 `AskUserQuestion`으로 반영 위치를 묻습니다:
-   - ① 본문 append — `edit_task_description(task_id, mode='append_work', bullets=[...])`로 `[작업 내용]`에 블렛 추가.
+   - ① 본문 append — `edit_task_description(task_id, mode='append_work', bullets=[...])`로 `[작업 내용]`에 블렛 추가(본문이 비어 있으면 `[작업 내용]` 라벨 블록을 신설).
    - ② 댓글 — `add_task_comment`에 `[추가 (YYYY-MM-DD)]` 라벨 + 블렛.
    - ③ 하위 태스크 — `create_task(parent=task_id, ...)`.
 4. **내용 변경**이면 `AskUserQuestion`으로 묻습니다:

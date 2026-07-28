@@ -1863,7 +1863,17 @@ def gdc_link_task(task_id: str = "", doc_path: str = "") -> str:
         f"문서: {doc_path or '(생략 시 현재 docs/requests 문서)'}\n"
         "1. 문서 경로를 확정합니다.\n"
         f"2. `link_task_to_doc(doc_path, {task_id})`를 호출 → 문서 frontmatter에 task_id/task_url 기록.\n"
-        "3. 연동 결과(task_id, 제목, URL, 문서 경로)를 보고합니다. 진행률을 바로 맞추려면 gdc_sync를 실행하세요."
+        f"3. `get_task({task_id or '<task_id>'})`로 현재 본문(description)을 가져와 문서(요청 내용/`## 작업 결과`)와 "
+        "**항목 단위로 비교**합니다(텍스트 diff가 아니라, 문서 항목이 태스크 본문에 이미 담겨 있는지). "
+        "이미 다 반영돼 있으면 5로 건너뜁니다(판단이 애매하면 4로 진행).\n"
+        "4. 미반영 항목이 있으면 AskUserQuestion으로 **2지선다**만 묻습니다 — ① 지금 반영 / ② 연동만.\n"
+        "   ②면 5로 건너뜁니다. ①이면 아래 **[반영 절차]**를 그대로 수행합니다"
+        "(반영 위치는 여기서 미리 묻지 않습니다 — [반영 절차]에서 분류 후 묻습니다).\n"
+        "5. 연동 결과(task_id, 제목, URL, 문서 경로)와 반영 결과를 보고합니다. "
+        "진행률·상태·실제 날짜는 gdc_sync가 담당합니다(연동 시 자동 동기화하지 않음).\n\n"
+        "[반영 절차] (4단계에서 ①을 고른 경우에만 수행 — gdc_apply와 동일)\n"
+        + _APPLY_HEAD
+        + _apply_steps(include_fetch=False, prefix="4-")
     )
 
 
@@ -1880,26 +1890,54 @@ def gdc_sync(path: str = "") -> str:
     )
 
 
+def _apply_steps(include_fetch: bool = True, prefix: str = "") -> str:
+    """문서 변경을 태스크에 반영하는 공통 절차(분류→질문→라우팅) 문구.
+
+    `gdc_apply`와 `gdc_link_task`(연동 후 반영) 프롬프트가 같은 문구를 공유해
+    절차가 갈라지지 않게 한다. 연동 직후처럼 task_id 확인·본문 확보가 이미
+    끝난 흐름에서는 `include_fetch=False`로 1단계를 생략한다.
+    `prefix`는 다른 절차 안에 끼워 넣을 때 바깥 단계 번호와 겹치지 않게
+    붙이는 접두다(예: "4-" → `4-1.`, `4-2.` …).
+    """
+    steps = []
+    if include_fetch:
+        steps.append(
+            "문서 frontmatter의 task_id 확인(없으면 link_task_to_doc/gdc_login 안내). "
+            "`get_task`로 현재 본문(description)을 가져옵니다."
+        )
+    steps += [
+        "문서(요청 내용/`## 작업 결과`)와 현재 본문을 비교해 **추가 작업**인지 **기존 내용 변경**인지 분류합니다.",
+        "**추가 작업**이면 AskUserQuestion으로 반영 위치를 묻습니다:\n"
+        "   ① 본문 append — `edit_task_description(task_id, mode='append_work', bullets=[...])`로 `[작업 내용]`에 블렛 추가"
+        "(본문이 비어 있으면 `[작업 내용]` 라벨 블록을 신설).\n"
+        "   ② 댓글 — `add_task_comment`에 `[추가 (YYYY-MM-DD)]` 라벨 + 블렛.\n"
+        "   ③ 하위 태스크 — `create_task(parent=task_id, ...)`.",
+        "**내용 변경**이면 AskUserQuestion으로 묻습니다:\n"
+        "   ① 본문만 최신화 — `edit_task_description(task_id, mode='replace_section', label='<라벨>', "
+        "new_body_html='<본문HTML>')`로 해당 라벨 섹션만 교체.\n"
+        "   ② 댓글만 — `add_task_comment`에 `[변경 (YYYY-MM-DD)]` + 변경 이유 + 전/후(본문 유지).\n"
+        "   ③ 둘 다 — 본문 교체 + 변경이력 댓글.\n"
+        "   변경 이유는 문서 diff·맥락에서 초안을 만들고 사용자가 수정하게 합니다.",
+        "replace_section 대상 섹션에 인라인 이미지가 있으면 도구가 경고합니다 — 유지(기본)/삭제를 "
+        "사용자에게 확인하고 keep_media로 반영하세요.",
+        "new_body_html은 GDC 리치텍스트 형식(`<p>...</p>`, `<ul><li><p>...</p></li></ul>`)으로 작성합니다"
+        "(라벨 문단 `<p><strong>라벨</strong></p>`은 도구가 유지).",
+        "반영 결과(모드·대상·URL, 이미지 경고 있으면 함께)를 보고합니다. "
+        "진행률·상태·날짜 동기화는 `/gdc-sync`가 담당합니다.",
+    ]
+    return "".join(f"{prefix}{i}. {s}\n" for i, s in enumerate(steps, 1))
+
+
+_APPLY_HEAD = "본문은 통째로 덮어쓰지 않습니다(인라인 이미지 유실 방지) — 아래 절차로 최소 편집/댓글/하위 태스크로 라우팅하세요.\n"
+
+
 @mcp.prompt
 def gdc_apply(path: str = "") -> str:
     """문서 변경을 연결된 태스크 본문/댓글/하위 태스크에 반영(분류→질문→라우팅)."""
     return (
         f"작업 요청 문서의 변경을 연결된 태스크에 반영합니다. 경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
-        "본문은 통째로 덮어쓰지 않습니다(인라인 이미지 유실 방지) — 아래 절차로 최소 편집/댓글/하위 태스크로 라우팅하세요.\n"
-        "1. 문서 frontmatter의 task_id 확인(없으면 link_task_to_doc/gdc_login 안내). `get_task`로 현재 본문(description)을 가져옵니다.\n"
-        "2. 문서(요청 내용/`## 작업 결과`)와 현재 본문을 비교해 **추가 작업**인지 **기존 내용 변경**인지 분류합니다.\n"
-        "3. **추가 작업**이면 AskUserQuestion으로 반영 위치를 묻습니다:\n"
-        "   ① 본문 append — `edit_task_description(task_id, mode='append_work', bullets=[...])`로 `[작업 내용]`에 블렛 추가.\n"
-        "   ② 댓글 — `add_task_comment`에 `[추가 (YYYY-MM-DD)]` 라벨 + 블렛.\n"
-        "   ③ 하위 태스크 — `create_task(parent=task_id, ...)`.\n"
-        "4. **내용 변경**이면 AskUserQuestion으로 묻습니다:\n"
-        "   ① 본문만 최신화 — `edit_task_description(task_id, mode='replace_section', label='<라벨>', new_body_html='<본문HTML>')`로 해당 라벨 섹션만 교체.\n"
-        "   ② 댓글만 — `add_task_comment`에 `[변경 (YYYY-MM-DD)]` + 변경 이유 + 전/후(본문 유지).\n"
-        "   ③ 둘 다 — 본문 교체 + 변경이력 댓글.\n"
-        "   변경 이유는 문서 diff·맥락에서 초안을 만들고 사용자가 수정하게 합니다.\n"
-        "5. replace_section 대상 섹션에 인라인 이미지가 있으면 도구가 경고합니다 — 유지(기본)/삭제를 사용자에게 확인하고 keep_media로 반영하세요.\n"
-        "6. new_body_html은 GDC 리치텍스트 형식(`<p>...</p>`, `<ul><li><p>...</p></li></ul>`)으로 작성합니다(라벨 문단 `<p><strong>라벨</strong></p>`은 도구가 유지).\n"
-        "7. 반영 결과(모드·대상·URL, 이미지 경고 있으면 함께)를 보고합니다. 진행률·상태·날짜 동기화는 `/gdc-sync`가 담당합니다."
+        + _APPLY_HEAD
+        + _apply_steps()
     )
 
 
