@@ -115,9 +115,14 @@ MCP 기능 검토에서 도출한 후보 중 3건을 한 묶음으로 처리한�
 
 ### Phase 2 — `get_task` 필드 보강 + 프로젝트 상세 캐시
 
-- [ ] `_project(project_id)` TTL 캐시 헬퍼 추가 + `set_context` 무효화, pytest(만료·무효화·히트 시 호출 0회)
-- [ ] 프로젝트 상세를 GET하는 8개 지점을 `_project` 경유로 교체(`project=` 인자로 이미 재사용 중인 경로는 그대로 유지)
-- [ ] `get_task` 응답에 누락 필드 추가 + docstring 갱신
+- [x] `_project(project_id)` TTL(60초) 캐시 헬퍼 + `_clear_project_cache()` 추가, `set_context`에서 무효화. `tests/test_project_cache.py` 9건(히트 시 호출 0회·프로젝트별 분리·TTL 만료 재조회·TTL 이내 유지·수동 무효화·`project=` 주입 시 캐시 미경유)
+- [x] 프로젝트 상세를 GET하던 **13개 지점 전부** `_project` 경유로 교체(`get_context`/`set_context`/`get_project_enums`/`_not_finished_names`/`_status_category`/`_resolve_members`/`_resolve_mention_usernames`/`_done_status_name`/`_in_progress_status_name`/`_apply_progress_sync`/`create_task`/`update_task`/`search_tasks`). `project=` 인자로 재사용 중인 경로는 그대로 유지
+- [x] `get_task` 응답에 누락 필드 13종 추가(`actual_start_date`/`actual_end_date`/`participants`/`creator_name`/`customer`/`customer_name`/`weight`/`is_pinned`/`is_archived`/`tags`/`mention_count`/`created_at`/`updated_at`) + docstring 갱신
+- [x] 로컬 사전 검증(Phase 2분) — WS3 / 45 이슈관리에 **읽기 전용** 호출: `get_task(15493)` 신규 필드 13종 전부 반환(REST 왕복 2회 = 태스크 상세 + 프로젝트 상세), 이어서 `get_project_enums(45)` 2회 호출에 **REST 왕복 0회**(캐시 공유 확인), `_clear_project_cache()` 후 1회 재조회. `mention_count`는 댓글 2건 태스크(15446)로 실값 확인. 데이터 생성·변경 없음, 컨텍스트 변경 없음
+- [x] 추가 검증(`participants`/`tags` 실값) — 태스크 15493에 관련자(user 46)·임시 태그를 지정해 `get_task`가 `[{"id":46,"name":"김선민"}]`·`["[임시검증]태그3"]`으로 매핑함을 확인. **임시 데이터 전량 원복**(관련자 해제·본문 복원·임시 태그 삭제, 프로젝트 잔여 태그 0건)
+- [x] `uv run python -m pytest tests/` 151건 통과(신규 9건 포함, 회귀 0)
+
+- [x] 검증 중 발견한 무효 파라미터 제거 — 서버는 태스크의 `tag_ids`를 **무시**한다(`TaskSerializer.create/update`가 `validated_data.pop("tags")` 후 사용하지 않고, 태그는 본문·댓글의 `tagMention`을 스캔하는 `sync_task_tags_from_content`로만 동기화). "성공했는데 반영 안 됨"을 없애기 위해 `create_task`·`update_task`에서 `tag_ids` 파라미터를 제거하고 docstring에 "태그는 tagMention으로만 지정, 읽기는 get_task"를 명시. 도구 스키마에서 사라진 것과 `update_task` 정상 동작(is_pinned 토글 후 원복)을 실호출로 확인
 
 ### Phase 3 — 알림·멘션 조회 도구 추가
 
@@ -140,6 +145,7 @@ MCP 기능 검토에서 도출한 후보 중 3건을 한 묶음으로 처리한�
 ### 범위 밖 (후속 후보)
 
 - 태그 노출 + 이름 해석 (`get_project_enums`에 `tags` 추가) — 실사용 없어 보류
+- 태그 지정 수단 자체 — 서버가 `tagMention` 마크업으로만 태그를 동기화하므로, 도구로 태그를 붙이려면 본문/댓글에 tagMention span을 삽입하는 별도 도구가 필요하다(실사용 요구가 생기면 검토)
 - 연관 태스크 링크 생성/삭제(`/api/tasks/links/`), 변경 이력(`/api/tasks/histories/`), 일괄 수정(`bulk_update`), 첨부 목록
 - 주간 싱크/대시보드 요약(`/api/dashboard/weekly-sync/`)
 - 알림 읽음 처리(`mark_read`/`read-all`)

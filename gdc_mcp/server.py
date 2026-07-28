@@ -12,6 +12,7 @@ import datetime
 import html
 import os
 import re
+import time
 from pathlib import Path
 
 import httpx
@@ -56,6 +57,34 @@ def _task_url(task_id: int) -> str:
 # -number 정렬 목록을 페이지로 훑으며 대상 번호를 수집한다. 대부분 프로젝트는 1페이지로 해결.
 _MENTION_PAGE_SIZE = 200
 _MENTION_MAX_PAGES = 5
+
+
+# --- 프로젝트 상세 캐시 ---------------------------------------------------------
+# 상태 enum·멤버·preset은 세션 중 거의 바뀌지 않는데 대부분의 태스크 도구가 이를 필요로 해
+# 같은 프로젝트를 반복 GET한다(도구 1회 호출 안에서 2회 이상 겹치는 경로도 있다).
+# 짧은 TTL 캐시로 왕복만 줄인다. 태스크 상세는 캐시하지 않는다 — 편집 직후 재조회가 잦아
+# stale 위험이 실익보다 크다.
+_PROJECT_TTL = 60.0
+_PROJECT_CACHE: dict[int, tuple[float, dict]] = {}
+
+
+def _project(project_id: int) -> dict:
+    """프로젝트 상세를 TTL(60초) 프로세스 캐시로 조회한다.
+
+    프로젝트 설정 변경은 세션 중 드물어 TTL만으로 충분하고, 컨텍스트 전환(set_context)
+    시점에는 캐시를 비운다.
+    """
+    now = time.monotonic()
+    cached = _PROJECT_CACHE.get(project_id)
+    if cached and now - cached[0] < _PROJECT_TTL:
+        return cached[1]
+    data = client.get(f"/api/projects/{project_id}/").json()
+    _PROJECT_CACHE[project_id] = (now, data)
+    return data
+
+
+def _clear_project_cache() -> None:
+    _PROJECT_CACHE.clear()
 
 
 def _has_task_mentions(text: str | None) -> bool:
@@ -196,7 +225,7 @@ async def get_context(ctx: Context) -> dict:
     project_name = None
     if c.get("project_id"):
         try:
-            project_name = client.get(f"/api/projects/{c['project_id']}/").json().get("name")
+            project_name = _project(c["project_id"]).get("name")
         except Exception:
             project_name = None
     return {
@@ -268,9 +297,10 @@ async def set_context(ctx: Context, workspace_id: int, project_id: int) -> dict:
     """
     root = await _current_root(ctx)
     tokens.save_context(root, workspace_id, project_id)
+    _clear_project_cache()  # 컨텍스트 전환 시 이전 프로젝트 상세를 남기지 않는다
     project_name = None
     try:
-        project_name = client.get(f"/api/projects/{project_id}/").json().get("name")
+        project_name = _project(project_id).get("name")
     except Exception:
         project_name = None
     return {
@@ -289,7 +319,7 @@ def get_project_enums(project_id: int) -> dict:
     완료 상태 = category=='done', 미완료 상태 = 그 보집합.
     태스크 생성/수정/필터 전에 유효한 값과 '미완료 집합'을 확인하는 용도.
     """
-    p = client.get(f"/api/projects/{project_id}/").json()
+    p = _project(project_id)
     statuses = [
         {
             "name": s["name"],
@@ -325,7 +355,7 @@ def _not_finished_names(project_id: int, project: dict | None = None) -> list[st
 
     project에 프로젝트 상세 응답을 넘기면 재조회 없이 재사용한다.
     """
-    p = project if project is not None else client.get(f"/api/projects/{project_id}/").json()
+    p = project if project is not None else _project(project_id)
     return [s["name"] for s in p.get("task_statuses", []) if s.get("category") != "done"]
 
 
@@ -484,7 +514,7 @@ def _resolve_members(
         return assignee, participant_ids
 
     if project is None:
-        project = client.get(f"/api/projects/{project_id}/").json()
+        project = _project(project_id)
     members = project.get("members", [])
     ids = {m.get("user") for m in members}
     by_name: dict[str, int] = {}
@@ -759,7 +789,7 @@ async def search_tasks(
     # 멤버 해석과 미완료 상태 목록은 같은 프로젝트 상세를 쓰므로 한 번만 받아 재사용한다.
     project = None
     if assignee is not None or participant or not_finished:
-        project = client.get(f"/api/projects/{project_id}/").json()
+        project = _project(project_id)
     assignee_id, participant_ids = _resolve_members(
         project_id, assignee, participant, project=project
     )
@@ -810,7 +840,6 @@ async def create_task(
     parent: int | None = None,
     customer: int | str | None = None,
     weight: int | None = None,
-    tag_ids: list[int] | None = None,
     participant_ids: list[int | str] | None = None,
 ) -> dict:
     """태스크를 생성한다. 필수: project(프로젝트 ID), title.
@@ -849,8 +878,11 @@ async def create_task(
     확장 필드(사용자가 명시할 때만 전달 — 질문으로 강요하지 않음):
     parent(상위 태스크 id), customer(고객사 id **또는 이름** — 이름은 현재 워크스페이스에서
     자동 해석, 모호하면 후보 안내), actual_start_date/actual_end_date, progress(0~100),
-    tag_ids(태그 id 리스트), weight(비중 % — **WBS 프로젝트 전용**, 비WBS는 호출 전 차단.
+    weight(비중 % — **WBS 프로젝트 전용**, 비WBS는 호출 전 차단.
     형제 그룹 비중 합 100 초과는 서버가 검증).
+
+    태그는 지정할 수 없다 — 서버가 태스크의 태그를 본문·댓글의 tagMention에서만 동기화하므로
+    태그 id를 보내도 무시된다(읽기는 get_task의 tags로 가능).
 
     제약(미충족 시 호출 전 ValueError로 안내·차단): 예상/실제 시작일 ≤ 종료일, 실제 종료일 미래 불가,
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
@@ -861,7 +893,7 @@ async def create_task(
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
     # 프로젝트 상세는 멤버 해석·WBS 가드·완료 카테고리 판정에 공용 — 필요할 때 1회만 조회
     project_json = (
-        client.get(f"/api/projects/{project}/").json()
+        _project(project)
         if (weight is not None or assignee is not None or participant_ids or status)
         else None
     )
@@ -893,7 +925,6 @@ async def create_task(
         "parent": parent,
         "customer": customer,
         "weight": weight,
-        "tag_ids": tag_ids,
         "participant_ids": participant_ids,
     }
     # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정 (명시 전달값 우선)
@@ -947,7 +978,6 @@ async def update_task(
     parent: int | None = None,
     weight: int | None = None,
     is_pinned: bool | None = None,
-    tag_ids: list[int] | None = None,
     participant_ids: list[int | str] | None = None,
     clear_fields: list[str] | None = None,
 ) -> dict:
@@ -963,7 +993,8 @@ async def update_task(
 
     사용자가 수정 권한을 가진 모든 편집 필드를 노출한다(읽기전용 id/number/creator 제외).
     status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인),
-    날짜는 'YYYY-MM-DD', parent는 ID, tag_ids는 ID 리스트.
+    날짜는 'YYYY-MM-DD', parent는 ID.
+    태그는 수정할 수 없다 — 서버가 본문·댓글의 tagMention에서만 태그를 동기화한다(읽기는 get_task).
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
     customer는 고객사 id **또는 이름** — 이름은 현재 워크스페이스에서 검색해 정확 일치를 자동 채택,
     모호하면 후보 목록으로 안내한다.
@@ -982,7 +1013,7 @@ async def update_task(
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
     if weight is not None or assignee is not None or participant_ids:
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
-        project_json = client.get(f"/api/projects/{project_id}/").json()
+        project_json = _project(project_id)
         if weight is not None:
             _ensure_wbs_weight(project_json)
         assignee, participant_ids = _resolve_members(
@@ -1011,7 +1042,6 @@ async def update_task(
             "parent": parent,
             "weight": weight,
             "is_pinned": is_pinned,
-            "tag_ids": tag_ids,
             "participant_ids": participant_ids,
         }.items()
         if v is not None
@@ -1136,7 +1166,7 @@ def _status_category(
     if not project_id or not status_name:
         return None
     if project is None:
-        project = client.get(f"/api/projects/{project_id}/").json()
+        project = _project(project_id)
     for s in project.get("task_statuses", []):
         if s.get("name") == status_name:
             return s.get("category")
@@ -1208,6 +1238,11 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
     - sub_tasks: 이 태스크의 하위 태스크 요약 목록(휴지통 제외, 서버 가시성 필터 적용).
     - related_tasks: outgoing/incoming 링크를 방향 유지로 통합({direction, link_type, task}).
     - parent: 직속 상위 태스크 요약(없으면 null).
+    - update_task로 쓸 수 있는 값도 함께 읽는다 — actual_start_date/actual_end_date(실제 날짜),
+      customer/customer_name(고객사), weight(비중, WBS 전용), is_pinned(고정), participants(관련자).
+      수정 전 현재 값 확인과 수정 후 반영 확인에 쓴다.
+    - 그 밖에 creator_name(작성자)·tags(태그 이름)·mention_count(댓글 수)·is_archived(숨김)·
+      created_at/updated_at을 함께 반환한다.
     상세 API 1회 호출로 모두 받으므로 추가 왕복이 없다(제목 해석 시 검색 1회 추가).
     """
     resolved_id = await _resolve_task(ctx, task_id)
@@ -1229,7 +1264,23 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
         "progress": t.get("progress"),
         "planned_start_date": t.get("planned_start_date"),
         "planned_end_date": t.get("planned_end_date"),
+        "actual_start_date": t.get("actual_start_date"),
+        "actual_end_date": t.get("actual_end_date"),
         "assignee_name": t.get("assignee_name"),
+        "participants": [
+            {"id": p.get("id"), "name": p.get("full_name") or p.get("username")}
+            for p in (t.get("participants_detail") or [])
+        ],
+        "creator_name": t.get("creator_name"),
+        "customer": t.get("customer"),
+        "customer_name": t.get("customer_name"),
+        "weight": t.get("weight"),
+        "is_pinned": t.get("is_pinned"),
+        "is_archived": t.get("is_archived"),
+        "tags": [g.get("name") for g in (t.get("tag_list") or [])],
+        "mention_count": t.get("mention_count"),
+        "created_at": t.get("created_at"),
+        "updated_at": t.get("updated_at"),
         "url": _task_url(t["id"]),
         "parent": _parent_summary(t),
         "sub_tasks": [_task_summary(s) for s in (t.get("sub_tasks") or [])],
@@ -1287,7 +1338,7 @@ def _apply_progress_sync(task_id: int, new_progress: int, description: str | Non
     """
     cur = client.get(f"{_TASKS}{task_id}/").json()
     project_id = cur.get("project")
-    statuses = client.get(f"/api/projects/{project_id}/").json().get("task_statuses", [])
+    statuses = _project(project_id).get("task_statuses", [])
     cat_of = {s["name"]: s.get("category") for s in statuses}
 
     def _pick(category: str, preferred: tuple[str, ...]) -> str | None:
@@ -1373,7 +1424,7 @@ def _done_status_name(project_id: int) -> str | None:
     완료 계열인 것을 우선('해결'/resolved보다 우선), 없으면 첫 done 상태.
     문서 메타데이터 상태가 done일 때 매핑 대상.
     """
-    statuses = client.get(f"/api/projects/{project_id}/").json().get("task_statuses", [])
+    statuses = _project(project_id).get("task_statuses", [])
     done = [s for s in statuses if s.get("category") == "done"]
     preferred = ("완료", "완료됨", "completed", "done", "closed", "종료")
     for s in done:
@@ -1388,7 +1439,7 @@ def _in_progress_status_name(project_id: int) -> str | None:
     category=='in_progress' 중 name이 '진행'/'진행중'/'in progress'인 것을 우선,
     없으면 첫 in_progress 상태. 문서 메타데이터 상태가 partial일 때 매핑 대상.
     """
-    statuses = client.get(f"/api/projects/{project_id}/").json().get("task_statuses", [])
+    statuses = _project(project_id).get("task_statuses", [])
     inprog = [s for s in statuses if s.get("category") == "in_progress"]
     for s in inprog:
         if s["name"].lower().replace(" ", "") in ("inprogress", "진행", "진행중"):
@@ -1554,7 +1605,7 @@ def _resolve_mention_usernames(
     if not mentions:
         return []
     if project is None:
-        project = client.get(f"/api/projects/{project_id}/").json()
+        project = _project(project_id)
     members = project.get("members", [])
     by_id: dict[int, tuple[str, str] | None] = {}
     by_name: dict[str, tuple[str, str] | None] = {}
