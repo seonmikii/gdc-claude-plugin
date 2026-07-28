@@ -201,19 +201,37 @@ def test_resolve_both_none_skips():
 
 
 # ---------------------------------------------------------------------------
-# _resolve_mention_usernames — 이름/id → username (댓글 멘션용)
+# _resolve_mention_usernames — 이름/id → (username, 표시이름) 쌍 (댓글 멘션용)
 # ---------------------------------------------------------------------------
+# 표시이름(full_name)은 멘션 span의 data-label로 쓰인다. 비어 있으면 username으로 대체
+# (프론트의 "label 없는 과거 데이터" 처리와 동일).
+
+PROJECT_NO_LABEL = {"members": [{"user": 303, "full_name": None, "username": "nolabel"}]}
+
 
 def test_mention_resolve_by_name():
-    assert _resolve_mention_usernames(1, ["김철수"], project=PROJECT) == ["chulsoo"]
+    assert _resolve_mention_usernames(1, ["김철수"], project=PROJECT) == [("chulsoo", "김철수")]
 
 
 def test_mention_resolve_by_username():
-    assert _resolve_mention_usernames(1, ["younghee"], project=PROJECT) == ["younghee"]
+    assert _resolve_mention_usernames(1, ["younghee"], project=PROJECT) == [("younghee", "이영희")]
 
 
 def test_mention_resolve_by_id_mixed():
-    assert _resolve_mention_usernames(1, [101, "202"], project=PROJECT) == ["chulsoo", "younghee"]
+    assert _resolve_mention_usernames(1, [101, "202"], project=PROJECT) == [
+        ("chulsoo", "김철수"),
+        ("younghee", "이영희"),
+    ]
+
+
+def test_mention_resolve_missing_full_name_falls_back_to_username():
+    """full_name이 없으면 표시이름을 username으로 대체한다 (id·이름 두 경로 모두)."""
+    assert _resolve_mention_usernames(1, [303], project=PROJECT_NO_LABEL) == [
+        ("nolabel", "nolabel")
+    ]
+    assert _resolve_mention_usernames(1, ["nolabel"], project=PROJECT_NO_LABEL) == [
+        ("nolabel", "nolabel")
+    ]
 
 
 def test_mention_resolve_non_member_raises():
@@ -227,19 +245,61 @@ def test_mention_resolve_empty_skips():
 
 
 # ---------------------------------------------------------------------------
-# _build_comment_html — 본문 HTML 변환 + 멘션 선두 주입
+# _build_comment_html — 본문 HTML 변환 + 멘션 span 선두 주입
 # ---------------------------------------------------------------------------
+# 프론트(@tiptap/extension-mention)는 span[data-type="mention"]만 멘션으로 재인식하고
+# `.mention` 클래스에 볼드+강조색 CSS가 걸려 있다. 평문 `@user`는 알림만 가고 강조되지 않는다.
+
+MENTION_CHULSOO = (
+    '<span data-type="mention" class="mention" data-id="chulsoo" '
+    'data-label="김철수">@chulsoo</span>'
+)
+MENTION_YOUNGHEE = (
+    '<span data-type="mention" class="mention" data-id="younghee" '
+    'data-label="이영희">@younghee</span>'
+)
+
 
 def test_build_comment_plain_no_mentions():
     assert _build_comment_html("안녕하세요", []) == "<p>안녕하세요</p>"
 
 
-def test_build_comment_prepends_mentions():
-    out = _build_comment_html("확인 부탁", ["chulsoo", "younghee"])
-    assert out == "<p>@chulsoo @younghee</p><p>확인 부탁</p>"
+def test_build_comment_prepends_mention_spans():
+    out = _build_comment_html("확인 부탁", [("chulsoo", "김철수"), ("younghee", "이영희")])
+    assert out == f"<p>{MENTION_CHULSOO} {MENTION_YOUNGHEE}</p><p>확인 부탁</p>"
 
 
 def test_build_comment_passthrough_html_with_mention():
     # 이미 HTML이면 통과하고, 멘션 문단만 앞에 붙는다
-    out = _build_comment_html("<p>이미 HTML</p>", ["chulsoo"])
-    assert out == "<p>@chulsoo</p><p>이미 HTML</p>"
+    out = _build_comment_html("<p>이미 HTML</p>", [("chulsoo", "김철수")])
+    assert out == f"<p>{MENTION_CHULSOO}</p><p>이미 HTML</p>"
+
+
+def test_build_comment_mention_attribute_order_is_fixed():
+    """`data-type`이 `data-label`보다 앞이어야 웹훅 평문(_tiptap_to_plain)이 @표시이름이 된다."""
+    out = _build_comment_html("확인", [("chulsoo", "김철수")])
+    assert out.index('data-type="mention"') < out.index('data-label="김철수"')
+
+
+def test_build_comment_mention_escapes_attributes():
+    """full_name·username의 특수문자는 속성·텍스트 모두 이스케이프한다(속성은 quote=True)."""
+    out = _build_comment_html("확인", [("a&b", '김"철&수')])
+    assert 'data-id="a&amp;b"' in out
+    assert 'data-label="김&quot;철&amp;수"' in out
+    assert ">@a&amp;b</span>" in out
+
+
+def test_build_comment_mention_with_task_link_coexist():
+    """멘션 span 선두 주입과 본문 `#N` 자동 링크가 함께 동작한다(#409 후속)."""
+    out = _build_comment_html(
+        "#409 확인",
+        [("chulsoo", "김철수")],
+        resolve_task=lambda n: ("https://gdc.gemiso.com/tasks/15434", "링크 연동")
+        if n == 409
+        else None,
+    )
+    assert out == (
+        f"<p>{MENTION_CHULSOO}</p>"
+        '<p><a target="_blank" rel="noopener noreferrer" '
+        'href="https://gdc.gemiso.com/tasks/15434">#409</a> (링크 연동) 확인</p>'
+    )

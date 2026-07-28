@@ -10,7 +10,7 @@ task_url: https://gdc.gemiso.com/tasks/15484
 | 유형 | feat |
 | 영역 | server/gdc_mcp |
 | 날짜 | 2026-07-28 |
-| 상태 | partial |
+| 상태 | done |
 | 관련 | 태스크 #417, server.py, tests/test_validation.py |
 
 ## 요청 내용
@@ -34,14 +34,30 @@ task_url: https://gdc.gemiso.com/tasks/15484
 - 멘션 span은 **인라인 노드**이므로 반드시 `<p>` 블록 안에 넣는다(현행 `<p>{prefix}</p>` 래핑 유지). 최상위 bare span으로 두면 재편집 시 문단 구조가 어긋난다.
 - `class="mention"`은 프론트 `UserMention.configure({HTMLAttributes:{class:'mention'}})` 산출과 동일하게 넣는다 — CSS 강조가 이 클래스에 걸려 있다.
 - 백엔드 알림 매칭은 `Mention.create`/`update`에서 `re.findall(r"@([\w.@+-]+)", content)`를 **원문 HTML**에 적용하므로(`backend/tasks/serializers.py:274`), span 내부 텍스트 `@{username}`으로 그대로 매칭된다 → 알림 호환.
+- **속성 순서가 웹훅 평문에 영향(고정 필요)**: 웹훅/알림 평문 변환 `_tiptap_to_plain`(`backend/tasks/signals.py:14-19`)은 `<span[^>]*data-type="mention"[^>]*data-label="([^"]*)"…`로 파싱하므로, **`data-type`이 `data-label`보다 앞**이고 **쌍따옴표**여야 평문이 `@{full_name}`이 된다. 순서가 어긋나면 span 태그가 일반 제거되어 `@{username}`으로 열화(기능 파손은 아니나 표시 품질 하락). 목표 형태는 이 조건을 만족하므로 **테스트에서 속성 순서를 단언해 고정**한다. `html.escape(quote=True)`가 만드는 `&quot;`는 리터럴 `"`가 아니므로 `[^"]*` 캡처를 깨지 않는다.
+- 프론트 파서 사양 재확인(`@tiptap/extension-mention@3.20`): 기본 `parseHTML`이 `span[data-type="mention"]`, 속성은 `data-id`→`id` / `data-label`→`label`. 뷰어(`RichTextViewer.tsx` `MentionViewer`)는 `@{label ?? id}`를 `class="mention"`으로 렌더 → 목표 형태와 일치.
+- **태그 동기화 부작용 없음**: 댓글 저장 시 호출되는 `sync_task_tags_from_content`의 `_TAG_MENTION_RE`는 `data-type="tagMention"`을 요구하므로(`serializers.py:88-90`), user mention span은 매칭되지 않는다(`data-id`가 비숫자여도 `int()` 오류 없음).
+- **v0.6.3 `is_html` 선두 앵커링과 무충돌**: 멘션 prefix는 `normalize_description` **이후** 결합되므로 본문 판별에 영향이 없고, `_HTML_TAG_RE`에는 `span`이 포함돼 있어 span으로 시작하는 HTML 재입력도 통과 처리된다.
 
 ## 작업 결과
 
-- [ ] `_resolve_mention_usernames`(`server.py:1352-1391`)가 username뿐 아니라 **full_name도 함께** 반환하도록 확장 (`(username, full_name)` 쌍 리스트). full_name이 비면 **username으로 대체**(프론트의 "label 없는 과거 데이터" 처리와 동일). 두 호출부(`add_task_comment` `server.py:1454`, `update_task_comment` `server.py:1483`) 시그니처 정리
-- [ ] `_build_comment_html`(`server.py:1394-1404`)의 prefix 생성을 평문 → 멘션 span으로 교체(`<p>` 문단 래핑 유지). `data-label`(full_name)·`data-id`는 **`html.escape(..., quote=True)`** 로 속성 이스케이프(full_name에 괄호·`&`·따옴표 포함 가능), span 내부 텍스트도 escape
-- [ ] 테스트 갱신(`tests/test_validation.py:204-246`): 기존 `_resolve_mention_usernames`(반환 타입 `list[str]` → 쌍 리스트) / `_build_comment_html`(평문 prefix 단언) 테스트를 새 스펙으로 수정 + 멘션 span 구조(data-type/data-id/data-label/`@username` 텍스트)·`#N` 태스크 언급 자동 링크 공존 회귀 추가
-- [ ] 실서버 라운드트립: 테스트 컨텍스트(워크스페이스 3 / 프로젝트 45)에서 멘션 등록 → 하이라이트 렌더 + 알림 발송 동시 확인, 임시 데이터 삭제 및 컨텍스트 원복
-- [ ] `README.md:145`(`add_task_comment` 행) 설명 갱신 + `plugin.json` 버전 범프 + `docs/INDEX.md` 이력 한 줄 추가
+- [x] `_resolve_mention_usernames`(`server.py:1352-1391`)가 username뿐 아니라 **full_name도 함께** 반환하도록 확장 (`(username, full_name)` 쌍 리스트). full_name이 비면 **username으로 대체**(프론트의 "label 없는 과거 데이터" 처리와 동일). **`by_id`·`by_name` 두 맵 모두** 쌍을 담아야 한다(user id 멘션 경로는 `by_id`(`server.py:1372`)를 타므로 `by_name`만 고치면 id 경로에서 label 유실). 두 호출부(`add_task_comment` `server.py:1454`, `update_task_comment` `server.py:1483`) 시그니처 정리
+- [x] `_build_comment_html`(`server.py:1394-1404`)의 prefix 생성을 평문 → 멘션 span으로 교체(`<p>` 문단 래핑 유지). `data-label`(full_name)·`data-id`는 **`html.escape(..., quote=True)`** 로 속성 이스케이프(full_name에 괄호·`&`·따옴표 포함 가능), span 내부 텍스트도 escape. 속성 순서는 `data-type` → `class` → `data-id` → `data-label` 고정(웹훅 평문 정규식 호환, 참고 사항 참조)
+- [x] 테스트 갱신(`tests/test_validation.py:204-246`): 기존 `_resolve_mention_usernames`(반환 타입 `list[str]` → 쌍 리스트) / `_build_comment_html`(평문 prefix 단언) 테스트를 새 스펙으로 수정 + 회귀 추가 — 멘션 span 구조(data-type/class/data-id/data-label/`@username` 텍스트), **속성 순서(`data-type`이 `data-label`보다 앞)**, **full_name 없는 멤버 → `data-label`=username 폴백**(현 `PROJECT` 픽스처는 두 멤버 모두 full_name 보유 → 폴백 미검증 상태), full_name 특수문자 escape, `#N` 태스크 언급 자동 링크 공존
+- [x] 도구 스펙(docstring) 갱신: `add_task_comment`(`server.py:1445` "`@user1 @user2` 한 줄") · `update_task_comment` · `_build_comment_html`(`server.py:1395-1399`) · 댓글 섹션 모듈 주석(`server.py:1347-1349`)의 "평문 멘션" 서술을 하이라이트 span 기준으로 수정 — docstring은 LLM이 보는 도구 스펙이므로 README보다 우선
+- [x] 실서버 라운드트립: 테스트 컨텍스트(워크스페이스 3 / 프로젝트 45)에서 멘션 등록 → 하이라이트 렌더 + 알림 발송 동시 확인, 임시 데이터 삭제 및 컨텍스트 **WS6/16으로 복원**
+- [x] `README.md:145`(`add_task_comment` 행) 설명 갱신 + `plugin.json` 버전 **0.6.3 → 0.6.4**(기존 도구 내 동작 개선) + `docs/INDEX.md` 이력 한 줄 추가
+
+## 로컬 사전 검증
+
+테스트 컨텍스트 WS3(‘[TEST] GDC 메인’)/프로젝트 45(‘이슈관리 테스트’)에서 실행. 실행 세션 MCP 서버는 구버전(v0.6.3)이라 **업데이트된 로컬 코드를 직접 호출**(`uv run python`, shim 미사용)해 검증했다.
+
+- [x] **pytest** — 119 passed(기존 115 + 신규 4). 구현 전 신규/수정 테스트 9건 실패 확인 후 구현(TDD).
+- [x] **저장 라운드트립**(임시 태스크 #15492, 댓글 42674) — 전송 HTML과 서버 저장본이 **바이트 단위 동일**(서버 sanitize·속성 재정렬 없음). 8개 단언 모두 PASS: `data-type="mention"`·`class="mention"`·`data-id`(username)·`data-label`(full_name)·span 텍스트 `@username`·**속성 순서(type<label)**·`<p>` 문단 래핑·본문 문단 보존.
+- [x] **알림 호환** — 응답 필드는 `mentioned_users`가 아니라 **`mentioned_users_detail`**(`MentionSerializer`). 임시 태스크 2건차에서 `[{id:46, username:'seonmiki98@gmail.com'}]` **1명만** 설정 → 이메일 username의 `@gmail.com` 추가 캡처가 무해하다는 문서 주장 실증(중복·오탐 없음). user id 경로(`by_id`) 해석도 `('seonmiki98@gmail.com','김선민')`로 정상.
+- [x] **수정 경로** — PATCH 후에도 span 유지, 본문만 교체됨(`#999` 미해결 언급은 평문 유지).
+- [x] **평문 변환 회귀** — `html_to_text`가 span을 일반 제거해 `@seonmiki98@gmail.com\n본문` 반환 → `list_task_comments` 출력 형태 기존과 동일.
+- [x] **정리** — 임시 댓글 2건·태스크 2건(#15492, 알림 확인용 1건) 삭제, `[임시검증]` 잔존 0건 확인, 컨텍스트 WS6/16(GDC-Support)로 복원.
 
 ## 참고 사항
 

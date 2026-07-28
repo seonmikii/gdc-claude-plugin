@@ -142,8 +142,8 @@ Claude Desktop은 **플러그인/마켓플레이스/슬래시 커맨드/훅을 �
 | `link_task_to_doc` | 기존 태스크를 기존 문서와 연동(새로 만들지 않음) |
 | `sync_doc_progress` | 문서의 Phase/체크박스 진척을 연결된 태스크 진행률·상태·날짜에 동기화(`description` 전달 시 태스크 본문도 함께 갱신) |
 | `list_task_comments` | 태스크 댓글(Mention) 목록 조회 |
-| `add_task_comment` | 태스크 댓글 작성(멘션 지원) |
-| `update_task_comment` | 태스크 댓글 수정 |
+| `add_task_comment` | 태스크 댓글 작성(멘션 지원 — 본문 선두에 하이라이트 멘션 삽입, 알림 발송) |
+| `update_task_comment` | 태스크 댓글 수정(`mentions` 재전달 시 하이라이트 멘션 유지) |
 | `delete_task_comment` | 태스크 댓글 삭제 |
 | `archive_task` | 태스크 숨기기/해제 토글(하위 일괄 처리, WBS 불가, `confirm` 게이트) |
 | `delete_task` | 태스크 삭제 — 소프트 삭제(휴지통 이동, 복구 가능, 관리자 이상, `confirm` 게이트) |
