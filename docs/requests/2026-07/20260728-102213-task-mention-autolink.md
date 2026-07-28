@@ -24,15 +24,15 @@ task_url: https://gdc.gemiso.com/tasks/15434
 ### 현황 (관련 코드 검토)
 
 - URL 자동 연동은 [doc_utils.py](gdc_mcp/doc_utils.py) `_escape_and_linkify`(순수 함수)로 구현됨 — description·댓글이 공유하는 `normalize_description`→`description_to_html` 경로에서 동작.
-- 태스크 상세 URL은 내부 **id** 기준(`_task_url`=`{_WEB_URL}/tasks/{id}`, [server.py:48](gdc_mcp/server.py#L48))인데 사용자는 **번호**(`#409`)로 언급 → **번호→id 변환에 REST 조회 필수**.
-- 번호 해석 메커니즘은 이미 존재: [server.py:502](gdc_mcp/server.py#L502) `_resolve_task`가 `client.get(_TASKS, params={"project", "search", "page_size"})`로 조회하고 결과에 `id`·`number`·`title`을 담는다. 번호는 **프로젝트 스코프**로 유일.
+- 태스크 상세 URL은 내부 **id** 기준(`_task_url`=`{_WEB_URL}/tasks/{id}`, [server.py](gdc_mcp/server.py))인데 사용자는 **번호**(`#409`)로 언급 → **번호→id 변환에 REST 조회 필수**.
+- 번호 해석 메커니즘은 이미 존재: [server.py](gdc_mcp/server.py) `_resolve_task`가 `client.get(_TASKS, params={"project", "search", "page_size"})`로 조회하고 결과에 `id`·`number`·`title`을 담는다. 번호는 **프로젝트 스코프**로 유일.
 - ∴ 번호 링크는 **순수 함수 밖(서버 계층)** 에서 `client` 기반 resolver로 처리해야 한다.
 
 ### 결정 사항
 
 | # | 항목 | 결정 |
 |---|------|------|
-| 1 | 언급 문법 | `#N`(N=숫자). 경계 규칙 `(?<!\w)#(\d+)\b` — 앞이 영숫자·`_`가 아니고 뒤가 숫자 경계. `이슈 #409`·`(#409)` O / `#fff`(색상)·`v2#3`의 `#3`은 앞이 숫자라 X, 마크다운 헤더 `# 제목`은 `#` 뒤 공백이라 X |
+| 1 | 언급 문법 | `#N`(N=숫자). 경계 규칙 `(?<![\w#])#(\d+)\b` — 앞이 영숫자·`_`·`#`가 아니고 뒤가 숫자 경계. `이슈 #409`·`(#409)` O / `#fff`(색상)·`v2#3`의 `#3`은 앞이 숫자라 X, 마크다운 헤더 `# 제목`은 `#` 뒤 공백이라 X |
 | 2 | 미해결 번호 | 현재 프로젝트에 없는 `#N`은 **평문 유지**(링크 안 함) |
 | 3 | 링크 표시 텍스트 | **확정**: `#N`만 링크(`<a>#409</a>`), 바로 뒤에 `(제목)`을 평문으로 본문 삽입. 예: `이슈 #409 참고` → `이슈 <a>#409</a> (HTML 변환시 링크 연동) 참고` |
 | 4 | 스코프 | **현재 컨텍스트 프로젝트 내 번호만**. 크로스 프로젝트/워크스페이스는 이번 범위 제외 |
@@ -52,9 +52,12 @@ task_url: https://gdc.gemiso.com/tasks/15434
 - [x] pytest — 순수 경로(mock resolver): 제목 괄호 삽입/미해결 평문/무주입 하위호환/경계(색상·단어뒤)/URL프래그먼트 오탐 없음/제목 이스케이프/중복 링크/normalize 전달/`mention_numbers` 디둡 — **9건 추가, 전체 111건 통과**
 - [x] 로컬 사전 검증 — `45 이슈관리 테스트`. 서버 구버전 → 업데이트 서버코드(`_task_resolver`+`normalize_description`) 직접 호출: `#5`→/tasks/15446·`#3` 링크, `#999`(없음) 평문. 실제 GDC 댓글 저장·재조회로 **`#N` 앵커·`(제목)`·미해결 평문 보존** 확인(검증 댓글 #42666 남김)
 - [x] `plugin.json` version `0.6.0` → `0.6.1` 상향(URL 링크 연동에 이어지는 후속이라 patch)
+- [x] 최종 검토 반영 — ① `doc_utils.is_html` 추출 + 서버 `_has_task_mentions` 게이트로 **이미 HTML인 본문/댓글은 번호 조회 자체를 생략**(update_task·댓글 경로의 헛된 `GET /tasks/{id}/` + 목록 스캔 제거), ② 목록 조회에 `ordering=-number` **명시**(서버 기본값 의존 제거 → 상한 스캔 범위 고정), ③ README에 자동 링크 동작 문단 추가(URL·`#N` 공통, v0.6.0분 누락 포함), ④ 문서 결정표 정규식·코드 링크 정합. pytest **112건 통과**
 
 ## 참고 사항
 
 - 변경 파일: [gdc_mcp/doc_utils.py](gdc_mcp/doc_utils.py), [gdc_mcp/server.py](gdc_mcp/server.py)
 - **번호 조회 비용**: gdc-service에 태스크 번호 필터·번호 검색이 없어(`TaskFilter`·BM25 search 실증) 목록을 페이지로 훑는다. ≤200 태스크 프로젝트는 1회 조회로 해결, 초과분·미해결·조회실패는 **평문 유지**(graceful). 언급 없는 본문/댓글은 추가 REST 0.
+- **링크되지 않는 경우(모두 평문 유지)**: 현재 프로젝트에 없는 번호 / 숨김(archived) 태스크(목록 미포함) / 페이지 상한 초과 / 조회 실패 / **입력이 이미 HTML**(변환 자체를 통과시키므로 언급 해석 안 함 — URL 자동 링크와 동일 정책).
+- 검증용으로 남긴 댓글(#42666, WS3/45)은 사용자가 확인 목적으로 **의도적으로 보존** 중 — 확인 후 삭제 대상.
 - 반영은 플러그인 재설치/서버 재기동 후 도구 호출부터 적용(실행 세션은 기동 시점 코드 사용).

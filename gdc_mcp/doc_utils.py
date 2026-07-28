@@ -100,6 +100,15 @@ _HTML_TAG_RE = re.compile(
 )
 
 
+def is_html(text: str | None) -> bool:
+    """이미 GDC 리치텍스트(HTML)인지 판별한다.
+
+    `normalize_description`이 통과시킬 입력인지 미리 알 수 있어, 서버 계층이 불필요한
+    선행 조회(예: `#N` 번호→id 매핑)를 건너뛰는 데도 쓴다.
+    """
+    return bool(text) and bool(_HTML_TAG_RE.search(text))
+
+
 def normalize_description(
     text: str | None, resolve_task: TaskResolver | None = None
 ) -> str | None:
@@ -118,7 +127,7 @@ def normalize_description(
     """
     if text is None:
         return None
-    if _HTML_TAG_RE.search(text):
+    if is_html(text):
         return text  # 이미 HTML — 통과
     return description_to_html(text, resolve_task=resolve_task)
 

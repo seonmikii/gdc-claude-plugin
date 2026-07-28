@@ -25,6 +25,7 @@ from .doc_utils import (
     compute_phase_progress,
     extract_title,
     html_to_text,
+    is_html,
     label_section_has_media,
     mention_numbers,
     normalize_description,
@@ -56,25 +57,33 @@ _MENTION_PAGE_SIZE = 200
 _MENTION_MAX_PAGES = 5
 
 
+def _has_task_mentions(text: str | None) -> bool:
+    """해석 대상 `#N` 언급이 있는지 — 이미 HTML이면 변환 자체를 건너뛰므로 조회도 불필요."""
+    return bool(text) and not is_html(text) and bool(mention_numbers(text))
+
+
 def _task_resolver(text: str | None, project_id: int | None):
     """평문 속 `#N`을 (url, title)로 미리 해석해 dict 백엔드 콜백을 반환한다(#409 후속).
 
     번호는 프로젝트 스코프로 유일하므로 project_id 기준. 언급이 없거나 project_id가 없으면
     None(콜백 미주입 → 언급 링크 생략, 기존 동작). 서버에 번호 필터가 없어 목록을 -number 순으로
     페이지 조회하며 대상 번호를 모은다(상한 초과분·미해결·조회 실패는 평문 유지 = graceful).
+    숨김(archived) 태스크는 목록에 없으므로 미해결과 같이 평문으로 남는다.
     """
-    if not text or project_id is None:
+    if project_id is None or not _has_task_mentions(text):
         return None
     remaining = mention_numbers(text)
-    if not remaining:
-        return None
-    remaining = set(remaining)
     mapping: dict[int, tuple[str, str]] = {}
     try:
         for page in range(1, _MENTION_MAX_PAGES + 1):
             data = client.get(
                 _TASKS,
-                params={"project": project_id, "page_size": _MENTION_PAGE_SIZE, "page": page},
+                params={
+                    "project": project_id,
+                    "ordering": "-number",  # 서버 기본값과 동일하지만, 상한 스캔 범위를 고정하려 명시
+                    "page_size": _MENTION_PAGE_SIZE,
+                    "page": page,
+                },
             ).json()
             for r in data.get("results", []):
                 num = r.get("number")
@@ -93,7 +102,7 @@ def _resolver_via_task(text: str | None, task_id: int):
 
     댓글·update_task처럼 project를 직접 갖지 않는 경로에서 씀. 언급이 있을 때만 태스크를 조회한다.
     """
-    if not text or not mention_numbers(text):
+    if not _has_task_mentions(text):
         return None
     project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
     return _task_resolver(text, project_id)
@@ -1408,7 +1417,7 @@ def add_task_comment(
     """
     usernames: list[str] = []
     resolve_task = None
-    if mentions or mention_numbers(content):
+    if mentions or _has_task_mentions(content):
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
         if mentions:
             usernames = _resolve_mention_usernames(project_id, mentions)
@@ -1436,7 +1445,7 @@ def update_task_comment(
     """
     usernames: list[str] = []
     resolve_task = None
-    if mentions or mention_numbers(content):
+    if mentions or _has_task_mentions(content):
         task_id = client.get(f"{_MENTIONS}{comment_id}/").json().get("task")
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
         if mentions:

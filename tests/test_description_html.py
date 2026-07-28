@@ -8,6 +8,7 @@ GDC description은 리치텍스트(HTML)로 저장·렌더링되므로(실증 �
 from gdc_mcp.doc_utils import (
     description_to_html,
     html_to_text,
+    is_html,
     mention_numbers,
     normalize_description,
 )
@@ -263,6 +264,13 @@ def test_normalize_none_passthrough():
 def test_normalize_plaintext_label_template_is_converted():
     out = normalize_description("[요약]\n문서 요약")
     assert out == "<p><strong>요약</strong></p><p>문서 요약</p>"
+
+
+def test_is_html_matches_normalize_passthrough_rule():
+    """is_html은 `normalize_description`이 통과시킬 입력과 같은 기준 — 서버가 선행 조회를 건너뛰는 근거."""
+    assert is_html("<p>이미 HTML #409</p>") is True
+    assert is_html("평문 #409 이고 progress < 100") is False
+    assert is_html(None) is False
 
 
 def test_normalize_already_html_passthrough_unchanged():
