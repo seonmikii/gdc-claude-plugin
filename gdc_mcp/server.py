@@ -25,7 +25,9 @@ from .doc_utils import (
     compute_phase_progress,
     extract_title,
     html_to_text,
+    is_html,
     label_section_has_media,
+    mention_numbers,
     normalize_description,
     read_frontmatter,
     read_metadata_table,
@@ -47,6 +49,63 @@ _WEB_URL = os.environ.get("GDC_WEB_URL", "http://localhost:5173").rstrip("/")
 
 def _task_url(task_id: int) -> str:
     return f"{_WEB_URL}/tasks/{task_id}"
+
+
+# 번호→id 조회 시 한 번에 받는 목록 크기·페이지 상한(가드). 번호 필터가 없어(API 미지원)
+# -number 정렬 목록을 페이지로 훑으며 대상 번호를 수집한다. 대부분 프로젝트는 1페이지로 해결.
+_MENTION_PAGE_SIZE = 200
+_MENTION_MAX_PAGES = 5
+
+
+def _has_task_mentions(text: str | None) -> bool:
+    """해석 대상 `#N` 언급이 있는지 — 이미 HTML이면 변환 자체를 건너뛰므로 조회도 불필요."""
+    return bool(text) and not is_html(text) and bool(mention_numbers(text))
+
+
+def _task_resolver(text: str | None, project_id: int | None):
+    """평문 속 `#N`을 (url, title)로 미리 해석해 dict 백엔드 콜백을 반환한다(#409 후속).
+
+    번호는 프로젝트 스코프로 유일하므로 project_id 기준. 언급이 없거나 project_id가 없으면
+    None(콜백 미주입 → 언급 링크 생략, 기존 동작). 서버에 번호 필터가 없어 목록을 -number 순으로
+    페이지 조회하며 대상 번호를 모은다(상한 초과분·미해결·조회 실패는 평문 유지 = graceful).
+    숨김(archived) 태스크는 목록에 없으므로 미해결과 같이 평문으로 남는다.
+    """
+    if project_id is None or not _has_task_mentions(text):
+        return None
+    remaining = mention_numbers(text)
+    mapping: dict[int, tuple[str, str]] = {}
+    try:
+        for page in range(1, _MENTION_MAX_PAGES + 1):
+            data = client.get(
+                _TASKS,
+                params={
+                    "project": project_id,
+                    "ordering": "-number",  # 서버 기본값과 동일하지만, 상한 스캔 범위를 고정하려 명시
+                    "page_size": _MENTION_PAGE_SIZE,
+                    "page": page,
+                },
+            ).json()
+            for r in data.get("results", []):
+                num = r.get("number")
+                if num in remaining:
+                    mapping[num] = (_task_url(r["id"]), r.get("title") or "")
+                    remaining.discard(num)
+            if not remaining or not data.get("next"):
+                break
+    except httpx.HTTPError:
+        pass  # 조회 실패 시 수집분만 사용(미해결은 평문 유지)
+    return (lambda n: mapping.get(n)) if mapping else None
+
+
+def _resolver_via_task(text: str | None, task_id: int):
+    """task_id로 프로젝트를 찾아 `#N` resolver를 만든다(언급이 없으면 REST 없이 None).
+
+    댓글·update_task처럼 project를 직접 갖지 않는 경로에서 씀. 언급이 있을 때만 태스크를 조회한다.
+    """
+    if not _has_task_mentions(text):
+        return None
+    project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
+    return _task_resolver(text, project_id)
 
 
 # --- 레포(루트)별 컨텍스트 ------------------------------------------------------
@@ -608,7 +667,9 @@ async def create_task(
         assignee = _current_user_id()
     if customer is not None:
         customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
-    description = normalize_description(description)  # 평문→HTML 변환(이미 HTML이면 통과)
+    description = normalize_description(
+        description, resolve_task=_task_resolver(description, project)
+    )  # 평문→HTML 변환(이미 HTML이면 통과) + #N 태스크 언급 링크
     fields: dict = {
         "project": project,
         "title": title,
@@ -714,7 +775,9 @@ async def update_task(
         )  # id 또는 이름
     if customer is not None:
         customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
-    description = normalize_description(description)  # 평문→HTML 변환(이미 HTML이면 통과)
+    description = normalize_description(
+        description, resolve_task=_resolver_via_task(description, task_id)
+    )  # 평문→HTML 변환(이미 HTML이면 통과) + #N 태스크 언급 링크
     payload = {
         k: v
         for k, v in {
@@ -1025,7 +1088,9 @@ def _apply_progress_sync(task_id: int, new_progress: int, description: str | Non
     raw = new_progress
     payload: dict = {"progress": _round_progress(raw)}
     if description is not None:
-        payload["description"] = normalize_description(description)  # 평문→HTML(이미 HTML이면 통과)
+        payload["description"] = normalize_description(
+            description, resolve_task=_task_resolver(description, cur.get("project"))
+        )  # 평문→HTML(이미 HTML이면 통과) + #N 태스크 언급 링크
 
     if old_progress == 0 and raw > 0 and not cur.get("actual_start_date"):
         payload["actual_start_date"] = today
@@ -1195,19 +1260,21 @@ async def task_from_doc(
             "url": fm.get("task_url") or _task_url(int(fm["task_id"])),
         }
 
-    description = _strip_meta_steps(description)  # 메타 단계 블렛 방어적 제거
-    description = normalize_description(description)  # 라벨 템플릿 → GDC 리치텍스트(HTML)(공통 진입점)
-
-    title = extract_title(text)
-    if not title:
-        raise ValueError("문서에서 제목(첫 '# ' 헤딩)을 찾지 못했습니다.")
-
     if project is None:
         project = (await _resolve_context(ctx)).get("project_id")
     if project is None:
         raise ValueError(
             "project를 결정할 수 없습니다. gdc_login으로 프로젝트를 선택해 저장하거나 project 인자를 전달하세요."
         )
+
+    description = _strip_meta_steps(description)  # 메타 단계 블렛 방어적 제거
+    description = normalize_description(
+        description, resolve_task=_task_resolver(description, project)
+    )  # 라벨 템플릿 → GDC 리치텍스트(HTML)(공통 진입점) + #N 태스크 언급 링크
+
+    title = extract_title(text)
+    if not title:
+        raise ValueError("문서에서 제목(첫 '# ' 헤딩)을 찾지 못했습니다.")
 
     # 문서 상태 매핑 (status 인자가 없을 때만): done→해결, partial→진행
     if status is None:
@@ -1293,12 +1360,13 @@ def _resolve_mention_usernames(
     return resolved
 
 
-def _build_comment_html(content: str, usernames: list[str]) -> str:
+def _build_comment_html(content: str, usernames: list[str], resolve_task=None) -> str:
     """본문을 GDC 리치텍스트(HTML)로 변환하고, 멘션이 있으면 `@user…` 문단을 선두에 붙인다.
 
     서버가 content의 `@username`을 파싱하므로, HTML 문단으로 감싸도 정규식이 사용자명을 찾는다.
+    resolve_task를 주면 본문의 `#N` 태스크 언급을 링크로 변환한다(#409 후속).
     """
-    html = normalize_description(content) or ""
+    html = normalize_description(content, resolve_task=resolve_task) or ""
     if usernames:
         prefix = " ".join(f"@{u}" for u in usernames)
         html = f"<p>{prefix}</p>{html}"
@@ -1348,10 +1416,13 @@ def add_task_comment(
     비멤버를 멘션하면 가능한 멤버 목록과 함께 오류로 안내한다.
     """
     usernames: list[str] = []
-    if mentions:
+    resolve_task = None
+    if mentions or _has_task_mentions(content):
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
-        usernames = _resolve_mention_usernames(project_id, mentions)
-    content_html = _build_comment_html(content, usernames)
+        if mentions:
+            usernames = _resolve_mention_usernames(project_id, mentions)
+        resolve_task = _task_resolver(content, project_id)
+    content_html = _build_comment_html(content, usernames, resolve_task=resolve_task)
     m = client.request(
         "POST", _MENTIONS, json={"task": task_id, "content": content_html}
     ).json()
@@ -1373,11 +1444,14 @@ def update_task_comment(
     content는 평문→HTML 자동 변환(이미 HTML이면 통과).
     """
     usernames: list[str] = []
-    if mentions:
+    resolve_task = None
+    if mentions or _has_task_mentions(content):
         task_id = client.get(f"{_MENTIONS}{comment_id}/").json().get("task")
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
-        usernames = _resolve_mention_usernames(project_id, mentions)
-    content_html = _build_comment_html(content, usernames)
+        if mentions:
+            usernames = _resolve_mention_usernames(project_id, mentions)
+        resolve_task = _task_resolver(content, project_id)
+    content_html = _build_comment_html(content, usernames, resolve_task=resolve_task)
     try:
         m = client.request(
             "PATCH", f"{_MENTIONS}{comment_id}/", json={"content": content_html}
