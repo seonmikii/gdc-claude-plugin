@@ -4,7 +4,7 @@
 
 ## 구성 요소
 
-- **MCP 서버(`gdc-local`, stdio)** — 태스크 조회/생성/수정, 태스크 숨기기·삭제·복구, 태스크 댓글, 작업 요청 문서 연동, 진행률 동기화 등 **도구 25종**. (Claude Code·Desktop 공통)
+- **MCP 서버(`gdc-local`, stdio)** — 태스크 조회/생성/수정, 태스크 숨기기·삭제·복구, 태스크 댓글, 작업 요청 문서 연동, 진행률 동기화 등 **도구 28종**. (Claude Code·Desktop 공통)
 - **슬래시 커맨드 12종** — `/gdc-login` `/gdc-switch` `/gdc-my-tasks` `/gdc-tasks` `/gdc-task` `/gdc-task-new` `/gdc-task-from-doc` `/gdc-doc-from-task` `/gdc-link-task` `/gdc-apply` `/gdc-sync` `/gdc-update`. (**Claude Code 전용**)
 - **PostToolUse 훅** — `docs/requests/**/*.md` 편집 시 연결된 태스크 진행률 자동 동기화. (**Claude Code 전용**)
 
@@ -34,23 +34,11 @@
 
 ### 업데이트 (새 버전 반영)
 
-플러그인 업데이트는 **터미널 CLI에서** 한다. CLI 세션에서는 `/gdc-update` 커맨드가 `claude`를 감지해 아래 두 명령을 대신 실행해준다.
-
 ```
 /gdc-update
 ```
 
-또는 두 명령을 직접 실행해도 된다(둘 다 CLI 전용). 실행 후 Claude Code를 재시작한다.
-
-```sh
-claude plugin marketplace update gdc-marketplace
-claude plugin update gdc-claude-plugin@gdc-marketplace
-```
-
-> `/plugin install`은 이미 설치된 경우 새 버전으로 **승격되지 않으니**(`already installed`) 반드시 `update`를 쓴다.
-
-> **⚠️ VSCode 확장에서는 업데이트가 안 된다.** 확장은 `claude` 바이너리를 셸 PATH에 올리지 않고(CLI 미존재), CLI용 `/plugin` 커맨드도 없으며, `/plugins` GUI의 마켓플레이스 새로고침은 캐시만 받을 뿐 설치 버전 포인터(`installed_plugins.json`)를 승격하지 않는다. 따라서 `/gdc-update` 커맨드도 확장에서는 실제 업데이트를 수행하지 못한다.
-> **업데이트하려면 CLI를 쓴다** — [standalone CLI](https://code.claude.com/docs/en/setup)를 설치한 뒤 VSCode 통합 터미널(`` Ctrl+` ``)에서 위 두 명령을 실행하고 Claude Code를 재시작한다.
+터미널 CLI·VSCode 확장 모두 동작한다(환경을 감지해 알아서 분기한다). 실행 후 **Claude Code를 재시작해야** 반영된다.
 
 > 설치/업데이트가 `EBUSY: resource busy or locked` 로 막히면, 실행 중인 MCP 서버가 캐시 폴더를 점유한 것이다. 플러그인을 **Disable 후 재설치**하거나, Claude Code를 **완전 재시작**한 뒤 다시 실행한다.
 
