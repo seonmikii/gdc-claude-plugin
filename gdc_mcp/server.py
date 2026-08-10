@@ -350,6 +350,72 @@ def get_project_enums(project_id: int) -> dict:
     }
 
 
+# --- 프로젝트 enum 값 해석 ------------------------------------------------------
+# 백엔드 모델 기본값(task_type=other / status=open / priority=medium)은 영문 시드 고정이라
+# WBS 프리셋 프로젝트(등록/보통/기타)에는 **존재하지 않는 값**이 저장된다. 서버 validator는
+# 값을 보낸 경우에만 enum 소속을 검사하므로, 생략하면 그대로 통과한다.
+# 프론트 생성 다이얼로그(TaskCreateDialog.tsx의 pickName)는 프로젝트 enum을 받아 기본값을
+# 보정한 뒤 항상 명시 전송한다 — 같은 규칙을 여기서도 적용해 UI 생성과 MCP 생성의 기본값이
+# 갈라지지 않게 한다. (enum 필드명, 라벨 매핑, 시드 선호 순서)
+_ENUM_KINDS: dict[str, tuple[str, dict[str, str], tuple[str, ...]]] = {
+    "status": ("task_statuses", _STATUS_LABELS, ("등록", "open")),
+    "priority": ("task_priorities", _PRIORITY_LABELS, ("보통", "medium")),
+    "task_type": ("task_types", _TASKTYPE_LABELS, ("기타", "other")),
+}
+
+
+def _resolve_enum_value(project: dict, kind: str, value: str | None) -> str | None:
+    """status/priority/task_type 값을 프로젝트 enum 기준으로 해석한다.
+
+    - 값이 있으면: 활성 항목과 정확 일치하면 통과. 아니면 한글 라벨↔영문 코드로 한 번 더
+      해석하고(`높음`↔`high`), 그래도 없으면 ValueError로 사용 가능한 값을 안내한다
+      (서버 400 대신 도구 레벨에서 차단).
+    - 값이 없으면: 프론트 pickName과 동일 규칙 — 시드 선호값을 먼저 찾고, 없으면 첫 활성 항목.
+    활성 항목이 없으면 입력값을 그대로 돌려준다(판단 근거가 없으므로 서버에 맡긴다).
+    """
+    field, labels, prefer = _ENUM_KINDS[kind]
+    names = [x["name"] for x in project.get(field, []) if x.get("is_active", True)]
+    if not names:
+        return value
+    if value is None:
+        return next((p for p in prefer if p in names), names[0])
+    if value in names:
+        return value
+    # 라벨 값에 중복이 없어 역매핑이 단사다 — 정방향(코드→라벨)·역방향(라벨→코드) 모두 시도
+    alt = labels.get(value) or next((code for code, ko in labels.items() if ko == value), None)
+    if alt in names:
+        return alt
+    raise ValueError(f"{kind} '{value}'는 이 프로젝트의 값이 아닙니다. 사용 가능: {', '.join(names)}")
+
+
+def _enum_checker():
+    """저장값이 프로젝트 enum에 없는 필드를 찾아내는 판정기를 만든다.
+
+    목록은 여러 프로젝트에 걸칠 수 있어(list_my_tasks의 컨텍스트 미설정 폴백 등)
+    프로젝트당 enum 집합을 한 번만 만들어 재사용한다(_project는 TTL 캐시).
+    비활성 항목도 소속으로 인정한다 — 비활성화된 값이 저장된 것은 정상이다.
+    """
+    cache: dict[int, dict[str, set[str]]] = {}
+
+    def check(task: dict) -> list[str]:
+        project_id = task.get("project")
+        if not project_id:
+            return []
+        if project_id not in cache:
+            p = _project(project_id)
+            cache[project_id] = {
+                kind: {x["name"] for x in p.get(field, [])}
+                for kind, (field, _labels, _prefer) in _ENUM_KINDS.items()
+            }
+        return [
+            kind
+            for kind, names in cache[project_id].items()
+            if names and task.get(kind) and task[kind] not in names
+        ]
+
+    return check
+
+
 def _not_finished_names(project_id: int, project: dict | None = None) -> list[str]:
     """프로젝트의 미완료(category != 'done') 상태 이름 목록.
 
@@ -359,14 +425,15 @@ def _not_finished_names(project_id: int, project: dict | None = None) -> list[st
     return [s["name"] for s in p.get("task_statuses", []) if s.get("category") != "done"]
 
 
-def _task_summary(t: dict) -> dict:
+def _task_summary(t: dict, mismatch: list[str] | None = None) -> dict:
     """태스크(목록/하위/연관 항목)를 표시용 요약 dict로 압축한다.
 
     list_tasks·get_task의 하위/연관 태스크 등 여러 곳에서 동일한 요약 형태를 재사용한다.
     입력은 TaskListSerializer 계열 필드(id·number·title·project*·status·priority·progress
     ·planned_end_date·assignee_name)를 가진 dict를 가정한다.
+    mismatch(_enum_checker 결과)가 있으면 enum_mismatch로 덧붙인다.
     """
-    return {
+    out = {
         "id": t["id"],
         "number": t.get("number"),
         "title": t.get("title"),
@@ -381,6 +448,9 @@ def _task_summary(t: dict) -> dict:
         "assignee_name": t.get("assignee_name"),
         "url": _task_url(t["id"]),
     }
+    if mismatch:
+        out["enum_mismatch"] = mismatch
+    return out
 
 
 def _finalize_task_list(results: list[dict], overdue: bool, undated: bool, limit: int) -> dict:
@@ -391,9 +461,10 @@ def _finalize_task_list(results: list[dict], overdue: bool, undated: bool, limit
     if undated:
         results = [t for t in results if not t.get("planned_end_date")]
     results = results[:limit]
+    check = _enum_checker()  # limit 적용 후에 판정 — 버려질 항목까지 검사하지 않는다
     return {
         "count": len(results),
-        "tasks": [_task_summary(t) for t in results],
+        "tasks": [_task_summary(t, check(t)) for t in results],
     }
 
 
@@ -873,6 +944,9 @@ async def create_task(
     ※ 이미 HTML(태그로 시작)을 넘기면 변환 없이 그대로 저장된다.
 
     값 형식: status/priority/task_type은 해당 프로젝트 enum의 'name', 날짜는 'YYYY-MM-DD'.
+    한글 라벨↔영문 코드는 자동 해석하고(`높음`↔`high`), 프로젝트에 없는 값은 호출 전 차단한다.
+    생략하면 프로젝트 enum 기준 기본값이 자동 적용된다 — 이슈관리형은 `open/medium/other`,
+    WBS형은 `등록/보통/기타`(웹 생성 다이얼로그와 동일 규칙).
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
 
     확장 필드(사용자가 명시할 때만 전달 — 질문으로 강요하지 않음):
@@ -891,14 +965,16 @@ async def create_task(
     (progress/actual_end_date를 직접 전달한 경우 그 값이 우선).
     """
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
-    # 프로젝트 상세는 멤버 해석·WBS 가드·완료 카테고리 판정에 공용 — 필요할 때 1회만 조회
-    project_json = (
-        _project(project)
-        if (weight is not None or assignee is not None or participant_ids or status)
-        else None
-    )
+    # 프로젝트 상세는 멤버 해석·WBS 가드·완료 카테고리 판정·enum 해석에 공용 — 1회만 조회
+    project_json = _project(project)
     if weight is not None:
         _ensure_wbs_weight(project_json)
+    # status/priority/task_type은 프로젝트 enum 기준으로 해석해 **항상 명시 전송**한다.
+    # 생략하면 서버가 영문 시드 고정 기본값을 쓰는데, WBS 프로젝트에는 없는 값이라
+    # 미완료 조회에서 태스크가 통째로 누락된다.
+    status = _resolve_enum_value(project_json, "status", status)
+    priority = _resolve_enum_value(project_json, "priority", priority)
+    task_type = _resolve_enum_value(project_json, "task_type", task_type)
     assignee, participant_ids = _resolve_members(
         project, assignee, participant_ids, project=project_json
     )  # id 또는 이름
@@ -992,7 +1068,8 @@ async def update_task(
       `edit_task_description`(replace_section/append_work)을 써서 인라인 이미지 유실을 막는다.
 
     사용자가 수정 권한을 가진 모든 편집 필드를 노출한다(읽기전용 id/number/creator 제외).
-    status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인),
+    status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인) —
+    한글 라벨↔영문 코드는 자동 해석하고, 프로젝트에 없는 값은 호출 전 차단한다.
     날짜는 'YYYY-MM-DD', parent는 ID.
     태그는 수정할 수 없다 — 서버가 본문·댓글의 tagMention에서만 태그를 동기화한다(읽기는 get_task).
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
@@ -1011,7 +1088,15 @@ async def update_task(
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
     """
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
-    if weight is not None or assignee is not None or participant_ids:
+    if (
+        weight is not None
+        or assignee is not None
+        or participant_ids
+        or status is not None
+        or priority is not None
+        or task_type is not None
+    ):
+        # 태스크 상세 1회 + 프로젝트 상세 1회(TTL 캐시)로 멤버 해석·WBS 가드·enum 해석을 모두 처리
         project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
         project_json = _project(project_id)
         if weight is not None:
@@ -1019,6 +1104,13 @@ async def update_task(
         assignee, participant_ids = _resolve_members(
             project_id, assignee, participant_ids, project=project_json
         )  # id 또는 이름
+        # 전달된 값만 해석·검증한다 — 미전달 필드에 기본값을 주입하면 부분 수정 의미가 깨진다
+        if status is not None:
+            status = _resolve_enum_value(project_json, "status", status)
+        if priority is not None:
+            priority = _resolve_enum_value(project_json, "priority", priority)
+        if task_type is not None:
+            task_type = _resolve_enum_value(project_json, "task_type", task_type)
     if customer is not None:
         customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
     description = normalize_description(
@@ -1243,11 +1335,16 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
       수정 전 현재 값 확인과 수정 후 반영 확인에 쓴다.
     - 그 밖에 creator_name(작성자)·tags(태그 이름)·mention_count(댓글 수)·is_archived(숨김)·
       created_at/updated_at을 함께 반환한다.
+    - enum_mismatch: 저장된 status/priority/task_type이 **프로젝트 enum에 없을 때만** 포함되는
+      필드명 목록. 라벨은 프론트 i18n 폴백대로 번역되므로(`other`→'기타') 겉보기로는 정상이지만,
+      이런 값은 상태 필터·미완료 조회에서 누락된다 → update_task로 프로젝트 값으로 고쳐야 한다.
     상세 API 1회 호출로 모두 받으므로 추가 왕복이 없다(제목 해석 시 검색 1회 추가).
     """
     resolved_id = await _resolve_task(ctx, task_id)
     t = client.get(f"{_TASKS}{resolved_id}/").json()
-    return {
+    check = _enum_checker()  # 하위 태스크와 프로젝트 조회를 공유
+    mismatch = check(t)
+    out = {
         "id": t["id"],
         "number": t.get("number"),
         "title": t.get("title"),
@@ -1283,9 +1380,12 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
         "updated_at": t.get("updated_at"),
         "url": _task_url(t["id"]),
         "parent": _parent_summary(t),
-        "sub_tasks": [_task_summary(s) for s in (t.get("sub_tasks") or [])],
+        "sub_tasks": [_task_summary(s, check(s)) for s in (t.get("sub_tasks") or [])],
         "related_tasks": _related_tasks(t),
     }
+    if mismatch:
+        out["enum_mismatch"] = mismatch
+    return out
 
 
 @mcp.tool
@@ -1536,6 +1636,7 @@ async def task_from_doc(
             "project를 결정할 수 없습니다. gdc_login으로 프로젝트를 선택해 저장하거나 project 인자를 전달하세요."
         )
 
+    project_json = _project(project)  # enum 해석·완료 카테고리 판정에 공용
     description = _strip_meta_steps(description)  # 메타 단계 블렛 방어적 제거
     description = normalize_description(
         description, resolve_task=_task_resolver(description, project)
@@ -1553,6 +1654,11 @@ async def task_from_doc(
         elif doc_status in ("partial", "in_progress", "in progress", "진행", "진행중"):
             status = _in_progress_status_name(project)
 
+    # create_task와 동일하게 프로젝트 enum 기준으로 해석해 항상 명시 전송한다
+    status = _resolve_enum_value(project_json, "status", status)
+    priority = _resolve_enum_value(project_json, "priority", priority)
+    task_type = _resolve_enum_value(project_json, "task_type", task_type)
+
     fields: dict = {
         "project": project,
         "title": title,
@@ -1563,7 +1669,7 @@ async def task_from_doc(
         "assignee": _current_user_id(),  # 기본 담당자 = 로그인 사용자
     }
     # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정
-    if status and _status_category(project, status) == "done":
+    if status and _status_category(project, status, project=project_json) == "done":
         fields["progress"] = 100
         fields["actual_end_date"] = datetime.date.today().isoformat()
     payload = {k: v for k, v in fields.items() if v is not None}
