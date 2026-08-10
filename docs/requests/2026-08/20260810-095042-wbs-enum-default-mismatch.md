@@ -1,3 +1,8 @@
+---
+task_id: 15761
+task_url: https://gdc.gemiso.com/tasks/15761
+---
+
 # MCP 태스크 생성 시 상태/우선순위/유형이 프로젝트 enum과 어긋나는 문제
 
 | 속성 | 값 |
