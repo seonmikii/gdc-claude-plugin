@@ -4,8 +4,8 @@
 
 ## 구성 요소
 
-- **MCP 서버(`gdc-local`, stdio)** — 태스크 조회/생성/수정, 태스크 숨기기·삭제·복구, 태스크 댓글, 작업 요청 문서 연동, 진행률 동기화 등 **도구 28종**. (Claude Code·Desktop 공통)
-- **슬래시 커맨드 12종** — `/gdc-login` `/gdc-switch` `/gdc-my-tasks` `/gdc-tasks` `/gdc-task` `/gdc-task-new` `/gdc-task-from-doc` `/gdc-doc-from-task` `/gdc-link-task` `/gdc-apply` `/gdc-sync` `/gdc-update`. (**Claude Code 전용**)
+- **MCP 서버(`gdc-local`, stdio)** — 태스크 조회/생성/수정, 태스크 숨기기·삭제·복구, 태스크 댓글, 작업 요청 문서 연동, 진행률 동기화, 건의사항 제출 등 **도구 31종**. (Claude Code·Desktop 공통)
+- **슬래시 커맨드 13종** — `/gdc-login` `/gdc-switch` `/gdc-my-tasks` `/gdc-tasks` `/gdc-task` `/gdc-task-new` `/gdc-task-from-doc` `/gdc-doc-from-task` `/gdc-link-task` `/gdc-apply` `/gdc-sync` `/gdc-suggest` `/gdc-update`. (**Claude Code 전용**)
 - **PostToolUse 훅** — `docs/requests/**/*.md` 편집 시 연결된 태스크 진행률 자동 동기화. (**Claude Code 전용**)
 
 ## 전제조건
@@ -69,6 +69,7 @@
 | `/gdc-link-task <task_id> [doc]` | 기존 태스크를 기존 문서와 연동 + 문서 내용 반영(선택) |
 | `/gdc-apply [path]` | 문서 변경을 태스크 본문/댓글/하위 태스크에 반영(분류→라우팅) |
 | `/gdc-sync [path]` | 문서 진행률을 연결된 태스크에 강제 동기화 |
+| `/gdc-suggest [내용\|list\|번호]` | 건의사항 제출 / 내 건의 목록 / 답변 확인 |
 | `/gdc-update` | gdc-marketplace 갱신 후 플러그인 최신 버전으로 승격 |
 
 ---
@@ -100,7 +101,7 @@ Claude Desktop은 **플러그인/마켓플레이스/슬래시 커맨드/훅을 �
    ```
 3. Claude Desktop을 재시작한다. 인증은 대화창에서 **`gdc_login` 프롬프트**(입력창 "+" 메뉴)를 실행하거나 "gdc 로그인"이라고 요청한다.
 
-> Desktop에서는 진행률 자동 동기화 훅과 `/gdc-*` 슬래시 커맨드는 동작하지 않는다. 동일 기능을 **MCP 프롬프트 11종**(`gdc_login`/`gdc_switch`/`gdc_my_tasks`/`gdc_tasks`/`gdc_task`/`gdc_task_new`/`gdc_task_from_doc`/`gdc_doc_from_task`/`gdc_link_task`/`gdc_apply`/`gdc_sync`)으로 "+" 메뉴에서 호출할 수 있고, 진행률 동기화는 `sync_doc_progress`(또는 `gdc_sync` 프롬프트)로 수동 실행한다.
+> Desktop에서는 진행률 자동 동기화 훅과 `/gdc-*` 슬래시 커맨드는 동작하지 않는다. 동일 기능을 **MCP 프롬프트 12종**(`gdc_login`/`gdc_switch`/`gdc_my_tasks`/`gdc_tasks`/`gdc_task`/`gdc_task_new`/`gdc_task_from_doc`/`gdc_doc_from_task`/`gdc_link_task`/`gdc_apply`/`gdc_sync`/`gdc_suggest`)으로 "+" 메뉴에서 호출할 수 있고, 진행률 동기화는 `sync_doc_progress`(또는 `gdc_sync` 프롬프트)로 수동 실행한다.
 >
 > ※ `/gdc-update`는 플러그인 CLI(마켓플레이스) 관리 커맨드라 대응 MCP 프롬프트가 없다. Desktop은 플러그인 개념이 없어(MCP 서버를 직접 등록) `git pull`로 최신 코드를 받아 Desktop을 재시작하면 반영된다.
 
@@ -140,6 +141,9 @@ Claude Desktop은 **플러그인/마켓플레이스/슬래시 커맨드/훅을 �
 | `list_trashed_tasks` | 현재 프로젝트 휴지통(삭제된 태스크) 목록 — 복구 대상 식별 |
 | `list_my_notifications` | 내 알림 목록(멘션·댓글·담당자 변경 등) + 미읽음 수 — 조회 전용, 전 워크스페이스 혼재 |
 | `list_my_mentions` | 나와 관련된 댓글 멘션 목록(`mentioned`/`authored`/`both`, 기간·검색) — 현재 컨텍스트 스코프, 조회 전용 |
+| `submit_suggestion` | GDC·플러그인 건의사항 제출(버그/기능 요청/개선 제안/기타) — 워크스페이스·프로젝트 무관, 컨텍스트 불필요 |
+| `list_my_suggestions` | 내가 제출한 건의사항 목록(상태·분류 필터) — 답변 여부(`has_reply`)까지, 본문·답변은 상세에서 |
+| `get_suggestion` | 건의사항 상세 — 본문 + 관리자 답변 + 답변자·답변 시각 |
 
 **본문·댓글 자동 링크(v0.6.x)**: 평문으로 넘긴 태스크 본문·댓글은 HTML로 변환될 때 ① `http(s)://` URL과 ② 같은 프로젝트의 태스크 언급 `#번호`가 자동으로 링크된다(`#409` → 해당 태스크 페이지 + 뒤에 `(제목)` 표시). 현재 프로젝트에 없는 번호·숨김 태스크는 평문 그대로 두고, 색상 코드(`#fff`)나 URL 프래그먼트는 링크하지 않는다. 이미 HTML로 넘긴 본문은 변환 없이 통과하므로 자동 링크도 적용되지 않는다.
 

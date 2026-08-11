@@ -2133,7 +2133,8 @@ _NOTIFICATION_LABELS = {
     "mention": "멘션", "description_mention": "설명 멘션",
     "assignee_change": "담당자 변경", "task_comment": "태스크 댓글",
     "participant_added": "관련자 추가", "task_status_changed": "태스크 상태 변경",
-    "task_updated": "태스크 수정",
+    "task_updated": "태스크 수정", "task_created": "태스크 생성",
+    "suggestion_replied": "건의사항 답변",
 }
 
 _DANGLING_TAG_RE = re.compile(r"<[^>]*$")
@@ -2270,6 +2271,226 @@ async def list_my_mentions(
             }
             for m in items
         ],
+    }
+
+
+# --- 건의사항 -------------------------------------------------------------------
+# 워크스페이스/프로젝트에 속하지 않는 전역 엔티티다 — 컨텍스트를 적용하지 않는다.
+
+_SUGGESTIONS = "/api/suggestions/"
+
+_SUGGESTION_CATEGORY_LABELS = {
+    "bug": "버그", "feature": "기능 요청",
+    "improvement": "개선 제안", "other": "기타",
+}
+_SUGGESTION_STATUS_LABELS = {
+    "received": "접수", "reviewing": "검토중", "planned": "반영예정",
+    "completed": "반영완료", "hold": "보류", "rejected": "반려",
+}
+
+_SUGGESTION_CONTENT_MIN = 5
+_SUGGESTION_CONTENT_MAX = 2000
+_SUGGESTION_TITLE_MAX = 200  # 서버 CharField(200) — 초과하면 400
+_SUGGESTION_AUTO_TITLE_MAX = 40
+
+# 서버가 page_size_query_param을 두지 않아 페이지 크기가 20건으로 고정이다(태스크와 다르다).
+# limit을 채우려면 page를 넘겨 모아야 한다.
+_SUGGESTION_MAX_PAGES = 10
+
+
+def _validate_suggestion_content(content: str) -> str:
+    """건의 본문 길이를 검증하고 앞뒤 공백을 정리한다.
+
+    서버엔 하한이 없어(TextField) 빈 문장 제출을 막는 지점은 도구 레벨이 유일하다.
+    """
+    text = (content or "").strip()
+    if len(text) < _SUGGESTION_CONTENT_MIN:
+        raise ValueError(
+            f"건의 본문은 최소 {_SUGGESTION_CONTENT_MIN}자 이상이어야 합니다. "
+            "무엇이 어떻게 불편한지 한 문장으로라도 적어주세요."
+        )
+    if len(text) > _SUGGESTION_CONTENT_MAX:
+        raise ValueError(
+            f"건의 본문은 최대 {_SUGGESTION_CONTENT_MAX}자까지 가능합니다(현재 {len(text)}자)."
+        )
+    return text
+
+
+def _suggestion_title(content: str, title: str | None = None) -> str:
+    """제목을 정한다 — 명시값이 있으면 그것, 없으면 본문 첫 줄."""
+    explicit = (title or "").strip()
+    if explicit:
+        return explicit[:_SUGGESTION_TITLE_MAX]
+    for line in (content or "").splitlines():
+        collapsed = " ".join(line.split())
+        if collapsed:
+            return collapsed[:_SUGGESTION_AUTO_TITLE_MAX]
+    return ""
+
+
+def _resolve_suggestion_choice(value: str | None, labels: dict[str, str], field: str) -> str | None:
+    """건의 분류/상태를 서버 코드값으로 해석한다(코드·한글 라벨 모두 허용)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text in labels:
+        return text
+    for code, label in labels.items():
+        if text == label:
+            return code
+    options = ", ".join(f"{code}({label})" for code, label in labels.items())
+    raise ValueError(f"{field}는 다음 중 하나여야 합니다: {options} — 받은 값: {value!r}")
+
+
+def _resolve_suggestion_category(value: str | None) -> str:
+    """분류를 해석한다. 생략하면 서버 기본값과 같은 improvement."""
+    if value is None:
+        return "improvement"
+    return _resolve_suggestion_choice(value, _SUGGESTION_CATEGORY_LABELS, "category")
+
+
+def _resolve_suggestion_status(value: str | None) -> str | None:
+    return _resolve_suggestion_choice(value, _SUGGESTION_STATUS_LABELS, "status")
+
+
+def _suggestion_not_deployed() -> ValueError:
+    return ValueError(
+        "이 서버에는 건의함 기능이 아직 배포되지 않았습니다(/api/suggestions/ 없음). "
+        "관리자에게 문의하거나 서버 업데이트 후 다시 시도하세요."
+    )
+
+
+@mcp.tool
+def submit_suggestion(
+    content: str,
+    category: str | None = None,
+    title: str | None = None,
+) -> dict:
+    """이 플러그인·GDC에 대한 건의사항(개선 요청·불편·버그)을 GDC 건의함에 제출한다.
+
+    사용자가 "이거 불편하다", "이런 기능이 있으면 좋겠다", "버그인 것 같다"고 말할 때 쓴다.
+    **워크스페이스/프로젝트와 무관한 전역 기능**이라 컨텍스트 설정 없이 어느 레포에서든 동작한다.
+    - content: 건의 본문(5~2000자). 무엇이 어떻게 불편한지 구체적으로 적을수록 좋다.
+      **토큰·비밀번호 등 자격증명은 넣지 말 것** — 관리자가 그대로 읽는다.
+    - category: bug(버그) / feature(기능 요청) / improvement(개선 제안, 기본) / other(기타).
+      한글 라벨로 줘도 해석한다.
+    - title: 생략하면 본문 첫 줄(최대 40자)로 자동 생성한다.
+    제출 후 처리 상태는 list_my_suggestions로, 관리자 답변 본문은 get_suggestion(id)로 확인한다.
+    답변이 달리면 알림(list_my_notifications)에 '건의사항 답변'으로 뜬다.
+    """
+    body = _validate_suggestion_content(content)
+    payload = {
+        "category": _resolve_suggestion_category(category),
+        "title": _suggestion_title(body, title),
+        "content": body,
+    }
+    try:
+        s = client.request("POST", _SUGGESTIONS, json=payload).json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise _suggestion_not_deployed() from e
+        raise
+    return {
+        "id": s.get("id"),
+        "title": s.get("title"),
+        "category": s.get("category"),
+        "category_label": _SUGGESTION_CATEGORY_LABELS.get(s.get("category"), s.get("category")),
+        "status": s.get("status"),
+        "status_label": _SUGGESTION_STATUS_LABELS.get(s.get("status"), s.get("status")),
+        "created_at": s.get("created_at"),
+        "message": (
+            f"건의사항이 접수되었습니다(#{s.get('id')}). 처리되면 알림으로 알려드립니다. "
+            "진행 상황은 list_my_suggestions로 확인할 수 있습니다."
+        ),
+    }
+
+
+@mcp.tool
+def list_my_suggestions(
+    status: str | None = None,
+    category: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """내가 제출한 건의사항 목록을 최신순으로 조회한다(조회 전용).
+
+    - status: received(접수)/reviewing(검토중)/planned(반영예정)/completed(반영완료)/
+      hold(보류)/rejected(반려). 한글 라벨도 해석한다.
+    - category: bug/feature/improvement/other (한글 라벨 허용).
+    - limit: 최대 건수(기본 20). 서버 페이지가 20건 고정이라 초과분은 page를 넘겨 모은다.
+    목록에는 **본문·관리자 답변이 없다** — has_reply가 true인 건을 get_suggestion(id)로 열어본다.
+    """
+    params: dict[str, str | int] = {"mine": "true"}
+    resolved_status = _resolve_suggestion_status(status)
+    if resolved_status:
+        params["status"] = resolved_status
+    if category is not None:
+        params["category"] = _resolve_suggestion_category(category)
+
+    items: list[dict] = []
+    total = None
+    try:
+        for page in range(1, _SUGGESTION_MAX_PAGES + 1):
+            data = client.get(_SUGGESTIONS, params={**params, "page": page}).json()
+            total = data.get("count")
+            items.extend(data.get("results", []))
+            if len(items) >= limit or not data.get("next"):
+                break
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise _suggestion_not_deployed() from e
+        raise
+    items = items[:limit]
+
+    return {
+        "count": len(items),
+        "total": total,
+        "suggestions": [
+            {
+                "id": s.get("id"),
+                "title": s.get("title"),
+                "category": s.get("category"),
+                "category_label": _SUGGESTION_CATEGORY_LABELS.get(
+                    s.get("category"), s.get("category")
+                ),
+                "status": s.get("status"),
+                "status_label": _SUGGESTION_STATUS_LABELS.get(s.get("status"), s.get("status")),
+                "has_reply": s.get("has_reply"),
+                "created_at": s.get("created_at"),
+            }
+            for s in items
+        ],
+    }
+
+
+@mcp.tool
+def get_suggestion(suggestion_id: int) -> dict:
+    """건의사항 1건의 상세를 조회한다 — 본문 + 관리자 답변 + 답변자/답변 시각.
+
+    list_my_suggestions에서 has_reply가 true인 건의 답변 내용을 읽을 때 쓴다.
+    남이 제출한 건의는 서버가 걸러내므로 조회되지 않는다(관리자 제외).
+    """
+    try:
+        s = client.get(f"{_SUGGESTIONS}{suggestion_id}/").json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise ValueError(
+                f"건의사항 #{suggestion_id}을(를) 찾을 수 없습니다. "
+                "번호가 맞는지, 본인이 제출한 건의인지 확인하세요."
+            ) from e
+        raise
+    return {
+        "id": s.get("id"),
+        "title": s.get("title"),
+        "content": s.get("content"),
+        "category": s.get("category"),
+        "category_label": _SUGGESTION_CATEGORY_LABELS.get(s.get("category"), s.get("category")),
+        "status": s.get("status"),
+        "status_label": _SUGGESTION_STATUS_LABELS.get(s.get("status"), s.get("status")),
+        "admin_reply": s.get("admin_reply") or None,
+        "replied_by_name": s.get("replied_by_name"),
+        "replied_at": s.get("replied_at"),
+        "created_at": s.get("created_at"),
+        "updated_at": s.get("updated_at"),
     }
 
 
@@ -2502,6 +2723,26 @@ def gdc_apply(path: str = "") -> str:
         f"작업 요청 문서의 변경을 연결된 태스크에 반영합니다. 경로: {path or '(생략 시 현재 docs/requests 문서)'}\n"
         + _APPLY_HEAD
         + _apply_steps()
+    )
+
+
+@mcp.prompt
+def gdc_suggest(request: str = "") -> str:
+    """GDC·플러그인 건의사항 제출 및 처리 상태 조회."""
+    return (
+        f"건의사항을 처리합니다. 사용자 입력: {request or '(없음)'}\n"
+        "입력에 따라 갈라집니다.\n"
+        "1. 비어 있거나 건의 내용이면 — 제출. `AskUserQuestion`으로 분류를 먼저 고르게 하고"
+        "(버그 / 기능 요청 / 개선 제안 / 기타), 본문이 없으면 무엇이 어떻게 불편한지 물어 받은 뒤 "
+        "`submit_suggestion(content, category)`를 호출합니다. 제목은 생략하면 본문 첫 줄로 자동 생성됩니다. "
+        "본문은 5~2000자이고, 토큰·비밀번호 같은 자격증명이 섞여 있으면 제출 전에 빼라고 알려주세요. "
+        "접수되면 접수 번호와 상태를 알려주고 진행 상황 확인 방법을 안내합니다.\n"
+        "2. 'list'면 — `list_my_suggestions()`로 조회해 번호/제목/분류/상태/답변 여부/제출일 표로 보여줍니다. "
+        "분류·상태는 category_label·status_label(한글)을 쓰고, has_reply가 true인 건이 있으면 "
+        "번호를 말하면 답변을 보여준다고 덧붙입니다.\n"
+        "3. 숫자면 — `get_suggestion(번호)`로 본문과 관리자 답변, 답변자·답변 시각을 보여줍니다. "
+        "admin_reply가 비어 있으면 아직 답변 전이라고 안내합니다.\n"
+        "건의사항은 워크스페이스/프로젝트와 무관한 전역 기능이라 컨텍스트 설정 없이 동작합니다."
     )
 
 
