@@ -2,6 +2,9 @@
 
 **Claude Code**(및 **Claude Desktop**)에서 **GDC(gdc-service)** 를 쓰기 위한 플러그인이다. MCP 도구 + 슬래시 커맨드 + 진행률 자동 동기화 훅을 한 번에 설치한다. 기본 연결 대상은 **운영 서버 `https://gdc.gemiso.com`**.
 
+> **📘 사용 안내서 — https://seonmikii.github.io/gdc-claude-plugin/**
+> 설치부터 일상적인 사용까지 화면과 예시로 안내한다. Claude Code / Claude Desktop 탭 전환, 한국어·English 지원. 처음 쓴다면 여기부터.
+
 ## 구성 요소
 
 - **MCP 서버(`gdc-local`, stdio)** — 태스크 조회/생성/수정, 태스크 숨기기·삭제·복구, 태스크 댓글, 작업 요청 문서 연동, 진행률 동기화, 건의사항 제출 등 **도구 31종**. (Claude Code·Desktop 공통)
