@@ -247,8 +247,16 @@ def list_workspaces() -> dict:
 
 @mcp.tool
 def list_projects(workspace_id: int) -> dict:
-    """지정 워크스페이스의 프로젝트 목록(전환용)."""
-    data = client.get("/api/projects/", params={"workspace": workspace_id, "page_size": 100}).json()
+    """지정 워크스페이스의 프로젝트 목록(전환용).
+
+    **종료 선언된 프로젝트는 제외한다**(서버 필터 `closed=false`, 판정은 `closed_at`).
+    종료 프로젝트는 서버가 수정 계열 요청을 막으므로 작업 대상이 될 수 없다. 그래도
+    전환해야 한다면 `set_context(workspace_id, project_id)`에 id를 직접 넘기면 된다.
+    """
+    data = client.get(
+        "/api/projects/",
+        params={"workspace": workspace_id, "page_size": 100, "closed": "false"},
+    ).json()
     items = data.get("results", []) if isinstance(data, dict) else data
     return {"projects": [{"id": p["id"], "name": p.get("name")} for p in items]}
 
