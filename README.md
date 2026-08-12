@@ -120,7 +120,7 @@ Claude Desktop은 **플러그인/마켓플레이스/슬래시 커맨드/훅을 �
 | `get_context` | 현재 레포에 적용되는 워크스페이스/프로젝트 확인 |
 | `set_context` | 현재 레포의 워크스페이스/프로젝트 전환(재인증 없이) |
 | `list_workspaces` | 접근 가능한 워크스페이스 목록 |
-| `list_projects` | 지정 워크스페이스의 프로젝트 목록 |
+| `list_projects` | 지정 워크스페이스의 프로젝트 목록 (종료된 프로젝트 제외) |
 | `list_customers` | 프로젝트에 지정 가능한 고객사 목록 |
 | `get_project_enums` | 프로젝트별 status/priority/task_type/members(담당자·관련자 후보) |
 | `list_my_tasks` | 내(담당/작성/참여) 미해결 태스크 — `not_finished`/`overdue`/`undated` |
