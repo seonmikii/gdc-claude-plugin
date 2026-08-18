@@ -323,9 +323,16 @@ async def set_context(ctx: Context, workspace_id: int, project_id: int) -> dict:
 def get_project_enums(project_id: int) -> dict:
     """프로젝트별 커스텀 status/priority/task_type enum을 조회한다.
 
+    **생성·수정에 지정할 수 있는 값은 `assignable_*_names`뿐이다.** statuses/priorities/
+    task_types 전체 목록에는 프로젝트 설정에서 비활성화된 항목(`is_active: false`)이 섞여
+    있다 — 이미 그 값으로 저장된 태스크를 해석하고 필터링하는 용도로 남겨둔 것이며, 새로
+    지정하면 거부된다(웹 UI 드롭다운도 활성 항목만 보여준다).
+    `assignable_*_names`가 비어 있으면 제약이 없다는 뜻이다(서버 검증에 위임).
+
     status는 category(planned/in_progress/done)를 포함한다.
     완료 상태 = category=='done', 미완료 상태 = 그 보집합.
-    태스크 생성/수정/필터 전에 유효한 값과 '미완료 집합'을 확인하는 용도.
+    done_status_names / not_finished_status_names는 **기존 태스크를 거르는 필터 값**이라
+    비활성 상태도 포함한다(빼면 그 상태로 저장된 태스크가 조회에서 누락된다).
     """
     p = _project(project_id)
     statuses = [
@@ -333,6 +340,7 @@ def get_project_enums(project_id: int) -> dict:
             "name": s["name"],
             "label": _STATUS_LABELS.get(s["name"], s["name"]),
             "category": s.get("category"),
+            "is_active": s.get("is_active", True),
         }
         for s in p.get("task_statuses", [])
     ]
@@ -341,16 +349,27 @@ def get_project_enums(project_id: int) -> dict:
         "project_name": p.get("name"),
         "workspace": p.get("workspace"),
         "statuses": statuses,
+        "assignable_status_names": _enum_names(p, "status")[0],
         "done_status_names": [s["name"] for s in statuses if s["category"] == "done"],
         "not_finished_status_names": [s["name"] for s in statuses if s["category"] != "done"],
         "priorities": [
-            {"name": x["name"], "label": _PRIORITY_LABELS.get(x["name"], x["name"])}
+            {
+                "name": x["name"],
+                "label": _PRIORITY_LABELS.get(x["name"], x["name"]),
+                "is_active": x.get("is_active", True),
+            }
             for x in p.get("task_priorities", [])
         ],
+        "assignable_priority_names": _enum_names(p, "priority")[0],
         "task_types": [
-            {"name": x["name"], "label": _TASKTYPE_LABELS.get(x["name"], x["name"])}
+            {
+                "name": x["name"],
+                "label": _TASKTYPE_LABELS.get(x["name"], x["name"]),
+                "is_active": x.get("is_active", True),
+            }
             for x in p.get("task_types", [])
         ],
+        "assignable_task_type_names": _enum_names(p, "task_type")[0],
         "members": [
             {"id": m.get("user"), "name": m.get("full_name") or m.get("username")}
             for m in p.get("members", [])
@@ -372,17 +391,30 @@ _ENUM_KINDS: dict[str, tuple[str, dict[str, str], tuple[str, ...]]] = {
 }
 
 
+def _enum_names(project: dict, kind: str) -> tuple[list[str], list[str]]:
+    """프로젝트 enum 이름을 (활성, 비활성)으로 가른다.
+
+    조회(get_project_enums의 assignable_*)와 검증(_resolve_enum_value)이 **같은 함수**를 보게
+    하는 단일 기준점이다 — 같은 식을 양쪽에 두면 한쪽만 바뀌어 갈라진다(조회에는 비활성이
+    섞여 나오는데 지정하면 거부되던 결함의 원인). is_active 누락은 활성으로 본다.
+    """
+    items = project.get(_ENUM_KINDS[kind][0], [])
+    active = [x["name"] for x in items if x.get("is_active", True)]
+    inactive = [x["name"] for x in items if not x.get("is_active", True)]
+    return active, inactive
+
+
 def _resolve_enum_value(project: dict, kind: str, value: str | None) -> str | None:
     """status/priority/task_type 값을 프로젝트 enum 기준으로 해석한다.
 
     - 값이 있으면: 활성 항목과 정확 일치하면 통과. 아니면 한글 라벨↔영문 코드로 한 번 더
       해석하고(`높음`↔`high`), 그래도 없으면 ValueError로 사용 가능한 값을 안내한다
-      (서버 400 대신 도구 레벨에서 차단).
+      (서버 400 대신 도구 레벨에서 차단). 비활성 항목이면 그 사유를 함께 알린다.
     - 값이 없으면: 프론트 pickName과 동일 규칙 — 시드 선호값을 먼저 찾고, 없으면 첫 활성 항목.
     활성 항목이 없으면 입력값을 그대로 돌려준다(판단 근거가 없으므로 서버에 맡긴다).
     """
-    field, labels, prefer = _ENUM_KINDS[kind]
-    names = [x["name"] for x in project.get(field, []) if x.get("is_active", True)]
+    _field, labels, prefer = _ENUM_KINDS[kind]
+    names, inactive = _enum_names(project, kind)
     if not names:
         return value
     if value is None:
@@ -393,6 +425,11 @@ def _resolve_enum_value(project: dict, kind: str, value: str | None) -> str | No
     alt = labels.get(value) or next((code for code, ko in labels.items() if ko == value), None)
     if alt in names:
         return alt
+    if value in inactive or (alt is not None and alt in inactive):
+        raise ValueError(
+            f"{kind} '{value}'는 이 프로젝트에서 비활성 상태라 지정할 수 없습니다"
+            f"(조회에는 보이지만 선택 불가). 사용 가능: {', '.join(names)}"
+        )
     raise ValueError(f"{kind} '{value}'는 이 프로젝트의 값이 아닙니다. 사용 가능: {', '.join(names)}")
 
 
@@ -926,6 +963,7 @@ async def create_task(
     [입력 수집 권장 흐름 — Desktop·Code 공통]
     호출 전에 사용자에게 컬럼을 **선택지로 하나씩 물어보고** 고른 값을 넘긴다:
     1) get_context로 현재 프로젝트 확인 → get_project_enums로 status/priority/task_type/members 조회.
+       선택지는 **`assignable_*_names`에 있는 값만** 쓴다(전체 목록에는 지정 불가한 비활성 항목이 섞여 있다).
     2) 제목·내용(description)·예상 시작/종료일만 **자유 입력**으로 받는다.
     3) status/priority/task_type/관련자는 **선택 질문(AskUserQuestion)**으로 제시 — 보기는 한글 label,
        각 질문에 반드시 "건너뛰기" 포함(실제 값 최대 3개, 나머지는 "기타"로). 고른 값의 name(관련자는 user id)을 넘긴다.
@@ -1076,8 +1114,8 @@ async def update_task(
       `edit_task_description`(replace_section/append_work)을 써서 인라인 이미지 유실을 막는다.
 
     사용자가 수정 권한을 가진 모든 편집 필드를 노출한다(읽기전용 id/number/creator 제외).
-    status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums로 확인) —
-    한글 라벨↔영문 코드는 자동 해석하고, 프로젝트에 없는 값은 호출 전 차단한다.
+    status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums의 `assignable_*_names`로 확인) —
+    한글 라벨↔영문 코드는 자동 해석하고, 프로젝트에 없거나 비활성인 값은 호출 전 차단한다.
     날짜는 'YYYY-MM-DD', parent는 ID.
     태그는 수정할 수 없다 — 서버가 본문·댓글의 tagMention에서만 태그를 동기화한다(읽기는 get_task).
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
@@ -1622,7 +1660,8 @@ async def task_from_doc(
       **done → '완료'(완료/closed 계열)**, **partial → '진행'(in_progress)**.
       그 외 값은 자동 매핑하지 않고 기본 상태로 둔다. status 인자를 주면 그 값이 우선한다.
     - 완료 보정: 최종 status가 완료 계열(category=='done')이면 progress=100·실제 종료일=오늘을 자동 주입한다.
-    - task_type: 호출하는 에이전트가 문서 유형/본문을 근거로 프로젝트 enum에 맞춰 매칭해 전달한다(get_project_enums 참고).
+    - task_type: 호출하는 에이전트가 문서 유형/본문을 근거로 프로젝트 enum에 맞춰 매칭해 전달한다
+      (get_project_enums의 `assignable_task_type_names` 중에서 고른다 — 비활성 항목은 거부된다).
     - project: 생략 시 현재 레포에서 gdc_login으로 저장한 프로젝트(레포별 컨텍스트)를 사용.
     - 담당자(assignee): 항상 로그인 사용자로 자동 등록(create_task와 동일).
     """
@@ -2585,7 +2624,8 @@ def gdc_task_new(request: str = "") -> str:
         "절차:\n"
         "1. `get_context`로 현재 레포의 project_id 확인(없으면 gdc_login 안내).\n"
         "2. `get_project_enums(project_id)`로 status/priority/task_type/members(관련자 후보 id·name) 조회. "
-        "보기는 한글 `label`, create_task에 넘길 값은 `name`. 목록은 프로젝트별 동적(커스텀 포함).\n"
+        "보기는 한글 `label`, create_task에 넘길 값은 `name`. 목록은 프로젝트별 동적(커스텀 포함). "
+        "**선택 보기는 `assignable_*_names`에 있는 값만** 씁니다(전체 목록의 `is_active: false` 항목은 지정하면 거부됩니다).\n"
         "3. 제목·내용(description)을 입력에서 받거나 한 번 물어봅니다. 내용은 **라벨 섹션 템플릿(평문)**으로 "
         "정리하면 도구가 GDC 리치텍스트(HTML)로 변환합니다 — `[요약]` 한두 줄 요약 → (선택·짝) `[AS-IS]`/`[TO-BE]` → "
         "`[작업 내용]` 아래 `-` 블렛(각 한 줄). 이미 HTML로 작성하면 그대로 전송됩니다(이중 변환 없음).\n"
@@ -2610,8 +2650,9 @@ def gdc_task_from_doc(path: str = "") -> str:
         "   **체크박스(`[ ]`/`[x]`)는 넣지 말 것**(진행 상태는 progress 필드 담당). "
         "**빌드·타입체크·검증·테스트·lint·커밋·배포/동작 확인·'INDEX.md 이력 추가' 같은 프로세스 메타 단계는 넣지 말 것**"
         "(실제 산출물 단계만; 원본 '작업 결과'에 있어도 옮기지 않는다). 넣더라도 도구가 자동 제거한다.\n"
-        "2. `get_project_enums(project_id)`로 `task_type` 목록을 조회해, 문서 메타표 `유형`+본문 내용에 가장 맞는 enum name을 "
-        "`task_type` 인자로 정합니다(확실하지 않으면 생략).\n"
+        "2. `get_project_enums(project_id)`로 `assignable_task_type_names`를 조회해, 문서 메타표 `유형`+본문 내용에 "
+        "가장 맞는 enum name을 그 목록 안에서 골라 `task_type` 인자로 정합니다(확실하지 않으면 생략). "
+        "전체 `task_types`에는 지정 불가한 비활성 항목이 섞여 있습니다.\n"
         "3. **생성 전 미리보기 + 단일 확인(항상)**: 태스크 생성 직전에 아래를 표로 보여주고 **한 번 확인**받습니다 — "
         "제목 / 렌더링될 본문(요약·AS-IS/TO-BE·작업 내용) / 상태 / 유형 / **우선순위**(priority; 기본 미지정). "
         "사용자가 원하는 항목(특히 우선순위)을 그 자리에서 바꿔 요청하면 반영해 다시 확인합니다.\n"
