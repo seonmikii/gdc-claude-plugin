@@ -256,3 +256,85 @@ def test_update_task_does_not_inject_defaults(sent, monkeypatch):
     asyncio.run(server.update_task(None, task_id=15748, status="open"))
     _method, _path, payload = sent[0]
     assert payload == {"status": "등록"}  # 전달한 필드만 — 부분 수정 의미 유지
+
+
+# --- 조회(get_project_enums)와 지정 가능 집합의 일치 --------------------------------
+# 결함 본체: 조회에는 비활성 항목이 섞여 나오는데 지정하면 거부됐다(조회 14종 / 수정 9종).
+# 조회 응답에 is_active를 싣고 assignable_*를 _resolve_enum_value와 **같은 헬퍼**로 산출해
+# 두 목록이 다시 갈라지지 않게 고정한다.
+
+# 재현 사례(프로젝트 16 GDC-Support)를 축약 — '기능 변경'이 조회에만 나오던 값
+MIXED_PROJECT = {
+    "name": "GDC-Support",
+    "workspace": 3,
+    "task_statuses": [
+        {"name": "open", "category": "planned", "is_active": True},
+        {"name": "in_progress", "category": "in_progress", "is_active": True},
+        {"name": "확인 필요", "category": "in_progress", "is_active": False},
+        {"name": "closed", "category": "done", "is_active": True},
+        {"name": "보류", "category": "done", "is_active": False},
+    ],
+    "task_priorities": [
+        {"name": "medium", "is_active": True},
+        {"name": "urgent", "is_active": False},
+    ],
+    "task_types": [
+        {"name": "development", "is_active": True},
+        {"name": "버그", "is_active": True},
+        {"name": "기능 변경", "is_active": False},
+        {"name": "other", "is_active": False},
+    ],
+}
+
+_KIND_FIELDS = [("status", "statuses"), ("priority", "priorities"), ("task_type", "task_types")]
+
+
+@pytest.fixture
+def mixed(monkeypatch):
+    monkeypatch.setattr(server, "_project", lambda _id: MIXED_PROJECT)
+    return server.get_project_enums(16)
+
+
+def test_enums_response_marks_each_item_with_is_active(mixed):
+    assert {x["name"]: x["is_active"] for x in mixed["task_types"]} == {
+        "development": True, "버그": True, "기능 변경": False, "other": False,
+    }
+    assert {x["name"]: x["is_active"] for x in mixed["priorities"]} == {"medium": True, "urgent": False}
+    assert [s["name"] for s in mixed["statuses"] if s["is_active"]] == ["open", "in_progress", "closed"]
+
+
+def test_every_assignable_name_passes_the_resolver(mixed):
+    # 조회 결과를 그대로 써도 수정이 실패하지 않는다 — 이 결함이 재발하면 여기서 걸린다
+    for kind, _field in _KIND_FIELDS:
+        names = mixed[f"assignable_{kind}_names"]
+        assert names, f"{kind}: 활성 항목이 있어야 한다"
+        for name in names:
+            assert server._resolve_enum_value(MIXED_PROJECT, kind, name) == name
+
+
+def test_every_inactive_name_is_rejected_with_reason(mixed):
+    # 통과 집합이 assignable_*와 문자 그대로 같지는 않다(라벨 별칭도 통과) — 반대 방향으로 고정한다
+    for kind, field in _KIND_FIELDS:
+        inactive = [x["name"] for x in mixed[field] if not x["is_active"]]
+        assert inactive, f"{kind}: 비활성 픽스처가 있어야 한다"
+        for name in inactive:
+            with pytest.raises(ValueError) as e:
+                server._resolve_enum_value(MIXED_PROJECT, kind, name)
+            assert "비활성" in str(e.value)
+
+
+def test_not_finished_names_keep_inactive_statuses(mixed):
+    # 기존 태스크를 거르는 필터 값이라 비활성도 포함해야 한다(빼면 그 상태의 태스크가 누락)
+    assert mixed["not_finished_status_names"] == ["open", "in_progress", "확인 필요"]
+    assert mixed["done_status_names"] == ["closed", "보류"]
+    assert mixed["assignable_status_names"] == ["open", "in_progress", "closed"]
+
+
+def test_assignable_is_empty_when_no_active_items(monkeypatch):
+    # 활성이 하나도 없으면 _resolve_enum_value가 값을 그대로 통과시킨다(서버 위임)
+    # → assignable_*는 빈 배열 = "제약 없음"
+    project = {"task_types": [{"name": "기타", "is_active": False}], "task_statuses": [], "task_priorities": []}
+    monkeypatch.setattr(server, "_project", lambda _id: project)
+    enums = server.get_project_enums(16)
+    assert enums["assignable_task_type_names"] == []
+    assert server._resolve_enum_value(project, "task_type", "기타") == "기타"
