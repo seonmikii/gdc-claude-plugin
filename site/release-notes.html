@@ -111,6 +111,18 @@
     .side { position: static; max-height: none; overflow: visible; }
   }
 
+  .vers a em.wip { color: var(--chg); background: var(--chg-bg); }
+  .wip-badge { font-size: 12px; font-weight: 800; letter-spacing: 0; color: var(--chg); background: var(--chg-bg); border-radius: 999px; padding: 3px 10px; }
+  .notice { margin-top: 22px; padding: 12px 16px; border-radius: 10px; background: var(--chg-bg); color: #6b4300; font-size: 14.5px; line-height: 1.6; }
+  .notice b { color: #4a2e00; }
+  .log { list-style: none; display: grid; }
+  .log li { display: grid; grid-template-columns: 92px 96px minmax(0, 1fr); gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--rule); color: var(--soft); }
+  .log li:last-child { border-bottom: none; padding-bottom: 0; }
+  .log .lv { font-weight: 800; color: var(--ink); }
+  .log .ld { color: var(--faint); font-size: 14px; }
+  .log-note { margin-top: 14px; font-size: 13.5px; color: var(--faint); }
+  @media (max-width: 640px) { .log li { grid-template-columns: 1fr; gap: 2px; } }
+
   /* ---------- masthead ---------- */
 
   header.card { padding: 40px 44px 34px; }
@@ -212,15 +224,15 @@
 <div class="wrap">
 
 <aside class="side">
-  <nav class="vers" aria-label="업데이트 버전">
+  <nav class="vers" aria-label="업데이트 버전" data-default="v2.10">
     <div class="toc-h">업데이트</div>
     <ul>
-      <li><a href="#v2.11" data-ver="v2.11">v2.11 <em>최신</em><small>2026.10</small></a></li>
-      <li><a href="#v2.10" data-ver="v2.10">v2.10<small>2026.10</small></a></li>
+      <li><a href="#v2.11" data-ver="v2.11">v2.11 <em class="wip">진행 중</em><small>v2.11.2</small></a></li>
+      <li><a href="#v2.10" data-ver="v2.10">v2.10 <em>최신</em><small>2026.10</small></a></li>
     </ul>
   </nav>
 
-  <nav class="toc" data-ver="v2.11" aria-label="v2.11 목차">
+  <nav class="toc" data-ver="v2.11" aria-label="v2.11 목차" hidden>
     <div class="toc-h">목차</div>
     <ol>
     <li><a href="#v211-weekly"><i>01</i>주간업무 / 회의 모드</a>
@@ -247,10 +259,11 @@
       </ol>
     </li>
     <li><a href="#v211-fixes"><i>04</i>버그 수정</a></li>
+    <li><a href="#v211-log"><i>05</i>변경 기록</a></li>
   </ol>
   </nav>
 
-  <nav class="toc" data-ver="v2.10" aria-label="v2.10 목차" hidden>
+  <nav class="toc" data-ver="v2.10" aria-label="v2.10 목차">
     <div class="toc-h">목차</div>
     <ol>
     <li><a href="#v210-customer-issues"><i>01</i>고객 접수</a>
@@ -291,11 +304,12 @@
   </nav>
 </aside>
 
-<main class="col" data-ver="v2.11">
+<main class="col" data-ver="v2.11" hidden>
 <header class="card">
-  <div class="kicker"><span class="ver">v2.11</span>GDC 업데이트 노트 · 2026.10</div>
+  <div class="kicker"><span class="ver">v2.11</span><span class="wip-badge">진행 중</span>GDC 업데이트 노트 · 현재 v2.11.2</div>
   <h1>v2.11 업데이트 안내</h1>
   <p class="lead">주간업무 회의 모드에서 고객 접수까지 함께 보고, 목차 · 상세 패널 · 구글 드라이브 업로드로 회의 준비가 쉬워졌습니다.</p>
+  <p class="notice"><b>로드맵 v2.11 진행 중</b> · 현재 v2.11.2입니다. 정식 공지 전까지 변경 내용이 계속 추가되며, 날짜별 내역은 맨 아래 <a href="#v211-log">변경 기록</a>에서 볼 수 있습니다.</p>
   <div class="summary" aria-label="변경 요약">
     <span><i class="tag new" style="padding:1px 7px;font-style:normal">신규</i><b data-count="new"></b>건</span>
     <span><i class="tag imp" style="padding:1px 7px;font-style:normal">개선</i><b data-count="imp"></b>건</span>
@@ -483,11 +497,19 @@
   </div>
 </section>
 
-<footer>GDC · v2.11 업데이트 노트</footer>
+<section class="card" id="v211-log">
+  <h2>변경 기록</h2>
+  <ul class="log">
+    <li><span class="lv">v2.11.2</span><span class="ld">2026-10-29</span><span>v2.10 이후 변경을 처음 정리했습니다. 신규 7건 · 개선 4건 · 버그 수정 3건</span></li>
+  </ul>
+  <p class="log-note">v2.11.0 ~ v2.11.2는 한 번에 정리했습니다. 이후 업데이트는 위에 한 줄씩 추가됩니다.</p>
+</section>
+
+<footer>GDC · v2.11 업데이트 노트 (진행 중)</footer>
 
 </main>
 
-<main class="col" data-ver="v2.10" hidden>
+<main class="col" data-ver="v2.10">
 
 
 <header class="card">
@@ -743,13 +765,15 @@
   }
 
   // #v2.10 opens a version; #<item id> opens the version holding that item.
+  // With no hash the last announced version (data-default) opens, so links in
+  // older announcements never land on a version that has not been announced yet.
   function route() {
     var h = decodeURIComponent(location.hash.slice(1));
     var isVer = verLinks.some(function (a) { return a.dataset.ver === h; });
     if (isVer) { show(h); window.scrollTo(0, 0); update(); return; }
     var el = h && document.getElementById(h);
     var m = el && el.closest('main[data-ver]');
-    show(m ? m.dataset.ver : verLinks[0].dataset.ver);
+    show(m ? m.dataset.ver : (document.querySelector('.vers').dataset.default || verLinks[0].dataset.ver));
     if (el) el.scrollIntoView();
     update();
   }
