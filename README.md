@@ -7,7 +7,7 @@
 
 ## 구성 요소
 
-- **MCP 서버(`gdc-local`, stdio)** — 태스크 조회/생성/수정, 태스크 숨기기·삭제·복구, 태스크 댓글, 작업 요청 문서 연동, 진행률 동기화, GitHub PR 연결, 건의사항 제출 등 **도구 34종**. (Claude Code·Desktop 공통)
+- **MCP 서버(`gdc-local`, stdio)** — 태스크 조회/생성/수정, 하위·연관 태스크 연결, 프로젝트 이동·일괄 변경, 태스크 숨기기·삭제·복구, 태스크 댓글, 작업 요청 문서 연동, 진행률 동기화, GitHub PR 연결, 주간 업무·캘린더·일정, 리소스 예약, 고객 접수, 건의사항 제출 등 **도구 54종**. (Claude Code·Desktop 공통)
 - **슬래시 커맨드 13종** — `/gdc-login` `/gdc-switch` `/gdc-my-tasks` `/gdc-tasks` `/gdc-task` `/gdc-task-new` `/gdc-task-from-doc` `/gdc-doc-from-task` `/gdc-link-task` `/gdc-apply` `/gdc-sync` `/gdc-suggest` `/gdc-update`. (**Claude Code 전용**)
 - **PostToolUse 훅** — `docs/requests/**/*.md` 편집 시 연결된 태스크 진행률 자동 동기화. (**Claude Code 전용**)
 
