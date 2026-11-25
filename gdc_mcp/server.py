@@ -332,6 +332,8 @@ def get_project_enums(project_id: int) -> dict:
 
     status는 category(planned/in_progress/done)를 포함한다.
     완료 상태 = category=='done', 미완료 상태 = 그 보집합.
+    tags는 이 프로젝트의 태그 목록({id, name}) — create_task/update_task/search_tasks의 tags 값으로 쓴다.
+    태그 정의(새 태그 만들기)는 프로젝트 설정 화면에서만 가능하다.
     done_status_names / not_finished_status_names는 **기존 태스크를 거르는 필터 값**이라
     비활성 상태도 포함한다(빼면 그 상태로 저장된 태스크가 조회에서 누락된다).
     """
@@ -375,6 +377,7 @@ def get_project_enums(project_id: int) -> dict:
             {"id": m.get("user"), "name": m.get("full_name") or m.get("username")}
             for m in p.get("members", [])
         ],
+        "tags": _project_tags(p),
     }
 
 
@@ -494,6 +497,11 @@ def _task_summary(t: dict, mismatch: list[str] | None = None) -> dict:
         "assignee_name": t.get("assignee_name"),
         "url": _task_url(t["id"]),
     }
+    # 목록 응답(TaskListSerializer)에만 있는 필드 — 하위 태스크 요약처럼 없는 응답에서 빈 값으로 오해하지 않게 있을 때만
+    if "tag_list" in t:
+        out["tags"] = [g.get("name") for g in (t.get("tag_list") or [])]
+    if t.get("is_report_task"):
+        out["is_report_task"] = True
     if mismatch:
         out["enum_mismatch"] = mismatch
     return out
@@ -675,6 +683,156 @@ def _ensure_wbs_weight(project: dict) -> None:
         )
 
 
+def _ensure_not_wbs(project: dict, label: str) -> None:
+    """웹 화면이 WBS 프로젝트에서 숨기는 필드(VDC 공유·영문 제목)는 여기서도 막는다."""
+    if project.get("preset") == "wbs":
+        raise ValueError(f"{label}은(는) WBS 프로젝트에서는 쓸 수 없습니다(웹 화면과 동일).")
+
+
+# --- 태그 (GDC 645056cb: tag_ids 수동 부착) -------------------------------------
+# 태그 정의는 프로젝트마다 따로다. 프로젝트 상세(`tags`)에 이미 들어 있어 추가 왕복 없이 해석한다.
+
+
+def _project_tags(project: dict) -> list[dict]:
+    """프로젝트 태그를 화면 순서(order, id)대로 {id, name} 목록으로."""
+    tags = sorted(project.get("tags") or [], key=lambda g: (g.get("order") or 0, g.get("id") or 0))
+    return [{"id": g.get("id"), "name": g.get("name")} for g in tags]
+
+
+def _resolve_tags(project: dict, values: list[int | str] | None) -> list[int]:
+    """태그(id 또는 이름, 대소문자 무시)를 이 프로젝트의 태그 id 목록으로 해석한다.
+
+    다른 프로젝트 태그 id·없는 이름은 서버 왕복 전에 가능한 목록과 함께 막는다(중복은 한 번만).
+    """
+    if not values:
+        return []
+    tags = _project_tags(project)
+    ids = {g["id"] for g in tags}
+    by_name = {str(g["name"]).strip().lower(): g["id"] for g in tags if g.get("name")}
+    out: list[int] = []
+    for v in values:
+        if not isinstance(v, bool) and (isinstance(v, int) or str(v).strip().isdigit()):
+            tid = int(v) if int(v) in ids else None
+        else:
+            tid = by_name.get(str(v).strip().lower())
+        if tid is None:
+            valid = ", ".join(f"{g['name']}(id={g['id']})" for g in tags)
+            raise ValueError(
+                f"태그 '{v}'은(는) 이 프로젝트에 없습니다. 가능한 태그: {valid or '(없음 — 프로젝트 설정에서 먼저 만들어야 합니다)'}"
+            )
+        if tid not in out:
+            out.append(tid)
+    return out
+
+
+def _merge_tag_ids(
+    current: list[int],
+    tags: list[int] | None = None,
+    add: list[int] | None = None,
+    remove: list[int] | None = None,
+) -> list[int]:
+    """최종 tag_ids를 계산한다. 서버의 tag_ids는 **통째 교체**라 추가·빼기는 현재 값에 합쳐 보낸다.
+
+    tags(교체)와 add/remove(부분 변경)는 함께 쓸 수 없다. add와 remove를 함께 쓰면 빼기를 먼저 적용한다.
+    """
+    if tags is not None and (add or remove):
+        raise ValueError("tags(통째 교체)와 add_tags/remove_tags(추가·빼기)는 함께 쓸 수 없습니다.")
+    if tags is not None:
+        return list(tags)
+    drop = set(remove or [])
+    out = [t for t in current if t not in drop]
+    for t in add or []:
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def _auto_customer(project: dict) -> int | None:
+    """프로젝트 고객사 자동 지정(#838) — 웹 생성 창(TaskCreateDialog)과 같은 조건.
+
+    비WBS + 자동 지정 켬 + 고객사가 보이는(가려지지 않은) 경우에만 프로젝트 고객사를 돌려준다.
+    서버 기본값이 아니라 웹이 채워 보내는 값이라, MCP 생성 경로에서도 같은 규칙을 적용한다.
+    """
+    if (
+        project.get("preset") != "wbs"
+        and project.get("auto_assign_customer")
+        and not project.get("customer_hidden")
+    ):
+        return project.get("customer")
+    return None
+
+
+_TASK_NUMBER_RE = re.compile(r"#\s*(\d+)")
+
+
+def _parse_task_number(value: int | str) -> int | None:
+    """'#850' 형식이면 태스크 번호(850)를, 아니면 None. 숫자만은 번호가 아니라 내부 id다."""
+    if isinstance(value, (int, bool)):
+        return None
+    m = _TASK_NUMBER_RE.fullmatch(str(value).strip())
+    return int(m.group(1)) if m else None
+
+
+# 연관 유형 — 서버 TaskLink.LinkType과 동일. 방향은 '이 태스크(원본) → 대상' 기준.
+_LINK_TYPE_LABELS = {"related": "관련", "blocks": "차단", "blocked_by": "차단됨"}
+
+
+def _resolve_link_type(value: str | None) -> str:
+    """연관 유형(영문 코드 또는 한글 라벨)을 서버 코드로. 생략하면 related."""
+    if value is None or not str(value).strip():
+        return "related"
+    v = str(value).strip().lower()
+    for code, label in _LINK_TYPE_LABELS.items():
+        if v in (code, label):
+            return code
+    raise ValueError(
+        f"연관 유형 '{value}'은(는) 지원하지 않습니다. 가능한 값: "
+        + ", ".join(f"{c}({l})" for c, l in _LINK_TYPE_LABELS.items())
+    )
+
+
+# 검색 범위(#825) — 서버 tasks/search.py SEARCH_SCOPES·프론트 searchScope 라벨과 동일.
+_SEARCH_SCOPE_LABELS = {"all": "전체", "content": "제목+내용", "comment": "댓글", "number": "번호"}
+
+
+def _resolve_search_scope(value: str | None) -> str | None:
+    """검색 범위(영문 코드 또는 한글 라벨)를 서버 코드로. 생략·all이면 None(서버 기본)."""
+    if value is None or not str(value).strip():
+        return None
+    v = str(value).strip().lower().replace(" ", "")
+    aliases = {**{c: c for c in _SEARCH_SCOPE_LABELS}, **{l: c for c, l in _SEARCH_SCOPE_LABELS.items()},
+               "제목내용": "content", "내용": "content", "제목": "content"}
+    code = aliases.get(v)
+    if code is None:
+        raise ValueError(
+            f"검색 범위 '{value}'은(는) 지원하지 않습니다. 가능한 값: "
+            + ", ".join(f"{c}({l})" for c, l in _SEARCH_SCOPE_LABELS.items())
+        )
+    return None if code == "all" else code
+
+
+def _server_error(e: httpx.HTTPStatusError) -> Exception:
+    """400/403/404 응답의 사용자용 문구(detail 또는 첫 필드 오류)를 ValueError로 올린다."""
+    if e.response.status_code in (400, 403, 404):
+        try:
+            body = e.response.json()
+        except ValueError:
+            body = None
+        msg = None
+        if isinstance(body, dict):
+            msg = body.get("detail")
+            if not msg:
+                for k, v in body.items():
+                    first = v[0] if isinstance(v, list) and v else v
+                    msg = f"{k}: {first}"
+                    break
+        elif isinstance(body, list) and body:
+            msg = str(body[0])
+        if msg:
+            return ValueError(str(msg))
+    return e
+
+
 def _resolve_customer(workspace_id: int | None, customer: int | str) -> int:
     """고객사(id 또는 이름)를 id로 해석한다.
 
@@ -713,9 +871,10 @@ def _resolve_customer(workspace_id: int | None, customer: int | str) -> int:
 async def _resolve_task(
     ctx: Context | None, id_or_title: int | str, show_archived: bool = False
 ) -> int:
-    """태스크 식별자(id 또는 제목)를 태스크 id로 해석한다.
+    """태스크 식별자(id·#번호·제목)를 태스크 id로 해석한다.
 
-    - 정수 또는 정수 문자열 → 그대로 태스크 id.
+    - 정수 또는 정수 문자열 → 그대로 태스크 id(내부 id — 화면의 번호와 다르다).
+    - '#850' → 현재 레포 프로젝트에서 번호 850인 태스크(서버 번호 정확 검색 `search=#N`, #793).
     - 그 외 문자열 → 현재 레포 프로젝트에서 search로 조회. 제목 정확 일치(대소문자 무시)가
       1건이면 채택, 그 외 다수면 후보 목록으로 안내(ValueError), 0건이면 오류(ValueError).
     제목 검색 범위는 현재 프로젝트로 한정한다(멤버/고객사 해석과 동일 UX).
@@ -732,13 +891,26 @@ async def _resolve_task(
     project_id = (await _resolve_context(ctx)).get("project_id")
     if project_id is None:
         raise ValueError(
-            "프로젝트가 설정되지 않았습니다. 제목으로 조회하려면 "
+            "프로젝트가 설정되지 않았습니다. #번호·제목으로 조회하려면 "
             "gdc_login 또는 set_context로 프로젝트를 선택하세요."
         )
-    params: dict[str, str | int] = {"project": project_id, "search": title, "page_size": 20}
+    number = _parse_task_number(title)
+    params: dict[str, str | int] = {
+        "project": project_id,
+        "search": f"#{number}" if number is not None else title,
+        "page_size": 20,
+    }
     if show_archived:
         params["show_archived"] = "true"
     results = client.get(_TASKS, params=params).json().get("results", [])
+    if number is not None:
+        hit = [r for r in results if r.get("number") == number]
+        if hit:
+            return hit[0]["id"]
+        raise ValueError(
+            f"현재 프로젝트에 #{number} 태스크가 없습니다(삭제·숨김 또는 다른 프로젝트일 수 있음). "
+            f"다른 프로젝트 태스크는 내부 id로 지정하세요."
+        )
     if not results:
         raise ValueError(
             f"제목 '{title}'에 해당하는 태스크를 현재 프로젝트에서 찾을 수 없습니다. "
@@ -788,6 +960,9 @@ def _search_params(
     undated: bool = False,
     ordering: str | None = None,
     limit: int = 20,
+    tag_ids: list[int] | None = None,
+    search_scope: str | None = None,
+    is_report_task: bool | None = None,
 ) -> dict[str, str | int]:
     """search_tasks의 서버 질의 파라미터를 조립한다(네트워크 없음 — 단위 테스트 대상).
 
@@ -796,7 +971,10 @@ def _search_params(
     - status를 명시하면 not_finished_names보다 우선한다.
     - overdue는 `planned_end_date_to=어제`로 서버에서 처리(planned_end_to와 함께 주면 더 이른 쪽).
     - undated는 서버 필터가 없어 page_size를 최대로 올려 선취한 뒤 호출부에서 거른다.
+    - tag_ids는 CSV `tags`(합집합), search_scope는 서버 코드(None=전체), is_report_task는 'true'/'false'.
     """
+    if search_scope and not query:
+        raise ValueError("search_scope(검색 범위)는 query(검색어)와 함께 써야 합니다.")
     if query and root_only:
         raise ValueError(
             "query와 root_only는 함께 쓸 수 없습니다. 서버 검색은 매칭된 하위 태스크를 "
@@ -849,6 +1027,12 @@ def _search_params(
         params["root_only"] = "true"
     if ordering:
         params["ordering"] = ordering
+    if tag_ids:
+        params["tags"] = ",".join(str(t) for t in tag_ids)
+    if search_scope:
+        params["search_scope"] = search_scope
+    if is_report_task is not None:
+        params["is_report_task"] = "true" if is_report_task else "false"
     return params
 
 
@@ -870,6 +1054,9 @@ async def search_tasks(
     undated: bool = False,
     ordering: str | None = None,
     limit: int = 20,
+    tags: list[int | str] | None = None,
+    search_scope: str | None = None,
+    is_report_task: bool | None = None,
 ) -> dict:
     """현재 레포 프로젝트에서 키워드·필터로 태스크를 검색한다.
 
@@ -882,6 +1069,11 @@ async def search_tasks(
       매칭이 많으면 "가장 관련 있는 N건"이 아니라 "매칭 중 최신 N건"이 온다. 응답의
       total_matched로 전체 매칭 수를 확인하고, 필요하면 필터를 좁히거나 limit을 올린다.
     - query는 root_only와 함께 쓸 수 없다(검색이 매칭한 하위 태스크가 통째로 걸러진다).
+    - query에 '#850'처럼 #번호를 주면 번호가 정확히 같은 태스크만, '850'만 주면 번호 일치 + 제목·내용 검색.
+    - search_scope: 검색 범위 — all(전체, 기본)/content(제목+내용)/comment(댓글)/number(번호). 한글 라벨도 된다.
+      query와 함께만 쓴다.
+    - tags: 태그 이름 또는 id 목록(합집합 — 하나라도 붙은 태스크). 값은 get_project_enums의 tags.
+    - is_report_task: True면 '주간 회의 공유'로 지정된 태스크만, False면 지정 안 된 것만.
     - status/priority/task_type: 상태·우선순위·유형 이름 목록(합집합). 값은 get_project_enums 참고.
     - assignee/participant/customer: user id 또는 **멤버 이름**, 고객사 id 또는 **고객사 이름** 허용.
     - planned_end_from/planned_end_to: 계획 종료일 범위(YYYY-MM-DD).
@@ -894,7 +1086,7 @@ async def search_tasks(
       200건을 넘는 프로젝트에서는 누락될 수 있다.
     - ordering: number/title/status/priority/progress/created_at/updated_at/planned_*/actual_* 중 하나
       (내림차순은 '-' 접두, 예: '-planned_end_date'). 생략 시 서버 기본(번호 내림차순).
-    - 응답: count(반환 건수)·total_matched(서버 전체 매칭 수)·tasks(요약 목록).
+    - 응답: count(반환 건수)·total_matched(서버 전체 매칭 수)·tasks(요약 목록 — tags 포함).
     """
     ctx_data = await _resolve_context(ctx)
     project_id = ctx_data.get("project_id")
@@ -905,8 +1097,10 @@ async def search_tasks(
 
     # 멤버 해석과 미완료 상태 목록은 같은 프로젝트 상세를 쓰므로 한 번만 받아 재사용한다.
     project = None
-    if assignee is not None or participant or not_finished:
+    if assignee is not None or participant or not_finished or tags:
         project = _project(project_id)
+    tag_ids = _resolve_tags(project, tags) if tags else None
+    scope = _resolve_search_scope(search_scope)
     assignee_id, participant_ids = _resolve_members(
         project_id, assignee, participant, project=project
     )
@@ -931,6 +1125,9 @@ async def search_tasks(
         undated=undated,
         ordering=ordering,
         limit=limit,
+        tag_ids=tag_ids,
+        search_scope=scope,
+        is_report_task=is_report_task,
     )
     data = client.get(_TASKS, params=params).json()
     # overdue는 서버 필터로 처리했으므로 클라이언트 필터는 undated만 적용한다.
@@ -958,6 +1155,10 @@ async def create_task(
     customer: int | str | None = None,
     weight: int | None = None,
     participant_ids: list[int | str] | None = None,
+    tags: list[int | str] | None = None,
+    is_report_task: bool | None = None,
+    needs_vdc_share: bool | None = None,
+    title_en: str | None = None,
 ) -> dict:
     """태스크를 생성한다. 필수: project(프로젝트 ID), title.
 
@@ -1000,10 +1201,14 @@ async def create_task(
     parent(상위 태스크 id), customer(고객사 id **또는 이름** — 이름은 현재 워크스페이스에서
     자동 해석, 모호하면 후보 안내), actual_start_date/actual_end_date, progress(0~100),
     weight(비중 % — **WBS 프로젝트 전용**, 비WBS는 호출 전 차단.
-    형제 그룹 비중 합 100 초과는 서버가 검증).
+    형제 그룹 비중 합 100 초과는 서버가 검증),
+    tags(태그 이름 또는 id 목록 — get_project_enums의 tags. 프로젝트에 없는 태그는 호출 전 차단),
+    is_report_task(주간 회의 공유 지정), needs_vdc_share(VDC 공유 필요)·title_en(영문 제목 —
+    VDC 공유용, needs_vdc_share와 함께) — 이 둘은 **WBS 프로젝트에서는 차단**(웹 화면과 동일).
 
-    태그는 지정할 수 없다 — 서버가 태스크의 태그를 본문·댓글의 tagMention에서만 동기화하므로
-    태그 id를 보내도 무시된다(읽기는 get_task의 tags로 가능).
+    고객사 자동 지정: customer를 생략하면 웹 생성 창과 같은 규칙으로 프로젝트 고객사가 들어간다
+    (프로젝트 설정 '태스크 고객사 자동 지정'이 켜진 비WBS 프로젝트만). 원치 않으면 생성 후
+    update_task(clear_fields=["customer"])로 비운다.
 
     제약(미충족 시 호출 전 ValueError로 안내·차단): 예상/실제 시작일 ≤ 종료일, 실제 종료일 미래 불가,
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
@@ -1016,6 +1221,11 @@ async def create_task(
     project_json = _project(project)
     if weight is not None:
         _ensure_wbs_weight(project_json)
+    if needs_vdc_share is not None:
+        _ensure_not_wbs(project_json, "VDC 공유 필요(needs_vdc_share)")
+    if title_en is not None:
+        _ensure_not_wbs(project_json, "영문 제목(title_en)")
+    tag_ids = _resolve_tags(project_json, tags) if tags else None
     # status/priority/task_type은 프로젝트 enum 기준으로 해석해 **항상 명시 전송**한다.
     # 생략하면 서버가 영문 시드 고정 기본값을 쓰는데, WBS 프로젝트에는 없는 값이라
     # 미완료 조회에서 태스크가 통째로 누락된다.
@@ -1029,6 +1239,8 @@ async def create_task(
         assignee = _current_user_id()
     if customer is not None:
         customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
+    else:
+        customer = _auto_customer(project_json)
     description = normalize_description(
         description, resolve_task=_task_resolver(description, project)
     )  # 평문→HTML 변환(이미 HTML이면 통과) + #N 태스크 언급 링크
@@ -1049,6 +1261,10 @@ async def create_task(
         "customer": customer,
         "weight": weight,
         "participant_ids": participant_ids,
+        "tag_ids": tag_ids,
+        "is_report_task": is_report_task,
+        "needs_vdc_share": needs_vdc_share,
+        "title_en": title_en,
     }
     # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정 (명시 전달값 우선)
     if status and _status_category(project, status, project=project_json) == "done":
@@ -1065,6 +1281,8 @@ async def create_task(
         "project_name": t.get("project_name"),
         "status": t.get("status"),
         "status_label": _STATUS_LABELS.get(t.get("status"), t.get("status")),
+        "customer_name": t.get("customer_name") or None,
+        "tags": [g.get("name") for g in (t.get("tag_list") or [])],
         "url": _task_url(t["id"]),
     }
 
@@ -1085,7 +1303,7 @@ _CLEARABLE_FIELDS = {
 @mcp.tool
 async def update_task(
     ctx: Context,
-    task_id: int,
+    task_id: int | str,
     title: str | None = None,
     description: str | None = None,
     status: str | None = None,
@@ -1098,13 +1316,22 @@ async def update_task(
     actual_start_date: str | None = None,
     actual_end_date: str | None = None,
     customer: int | str | None = None,
-    parent: int | None = None,
+    parent: int | str | None = None,
     weight: int | None = None,
     is_pinned: bool | None = None,
     participant_ids: list[int | str] | None = None,
     clear_fields: list[str] | None = None,
+    tags: list[int | str] | None = None,
+    add_tags: list[int | str] | None = None,
+    remove_tags: list[int | str] | None = None,
+    is_report_task: bool | None = None,
+    needs_vdc_share: bool | None = None,
+    title_en: str | None = None,
 ) -> dict:
     """태스크를 부분 수정(PATCH)한다. 전달한 필드만 갱신된다.
+
+    task_id·parent는 태스크 id(정수), **'#850' 같은 #번호**, 또는 제목 — #번호·제목은 현재 프로젝트에서
+    해석한다. ⚠️ 숫자만 넘기면 화면의 번호가 아니라 **내부 id**다(#850과 id 850은 다른 태스크).
 
     [description — 라벨 섹션 템플릿(평문)]
     본문을 교체할 때는 평문 한 문단이 아니라 `create_task`와 동일한 라벨 섹션 템플릿으로 넘긴다:
@@ -1117,14 +1344,23 @@ async def update_task(
     사용자가 수정 권한을 가진 모든 편집 필드를 노출한다(읽기전용 id/number/creator 제외).
     status/priority/task_type은 해당 프로젝트 enum 'name'(get_project_enums의 `assignable_*_names`로 확인) —
     한글 라벨↔영문 코드는 자동 해석하고, 프로젝트에 없거나 비활성인 값은 호출 전 차단한다.
-    날짜는 'YYYY-MM-DD', parent는 ID.
-    태그는 수정할 수 없다 — 서버가 본문·댓글의 tagMention에서만 태그를 동기화한다(읽기는 get_task).
+    날짜는 'YYYY-MM-DD'.
     assignee·participant_ids는 user id **또는 멤버 이름**(full_name/username)을 넘기면 자동으로 id로 해석한다.
     customer는 고객사 id **또는 이름** — 이름은 현재 워크스페이스에서 검색해 정확 일치를 자동 채택,
     모호하면 후보 목록으로 안내한다.
     weight(비중 %)는 **WBS 프로젝트 전용** — 비WBS 태스크에 전달하면 호출 전 차단.
     parent 변경 시 서버가 weight를 자동 초기화한다(weight를 함께 전달하면 그 값 적용).
+    여러 태스크를 한 상위 아래로 붙일 때는 `link_subtasks`, 상위에서 떼어낼 때는 `unlink_subtasks`가 간단하다.
     완료 상태(category=='done')로 전환하면 백엔드가 progress=100·actual_end_date를 자동 보정할 수 있다.
+
+    태그(이름 또는 id — get_project_enums의 tags):
+    - add_tags / remove_tags: 현재 태그에 추가·빼기(둘을 함께 쓰면 빼기 먼저). 보통은 이쪽을 쓴다.
+    - tags: 태그를 **통째로 교체**(tags=[]이면 모두 제거). add/remove와 함께 쓸 수 없다.
+    - 같은 요청에 본문을 바꾸면 본문 속 태그 언급(tagMention)의 태그가 그 위에 더해진다(서버 규칙).
+    is_report_task(주간 회의 공유), needs_vdc_share(VDC 공유 필요)·title_en(영문 제목, ""로 비움) —
+    뒤의 둘은 WBS 프로젝트에서 차단(웹 화면과 동일).
+    is_pinned(고정): 서버의 고정 규칙(프로젝트당 최대 5개, 하위·숨긴 태스크 불가)을 그대로 따른다 —
+    이미 원하는 상태면 아무것도 하지 않는다.
 
     필드 해제(비우기): clear_fields에 필드명 리스트를 전달 — 가능: parent, assignee, customer,
     planned_start_date, planned_end_date, actual_start_date, actual_end_date, weight.
@@ -1135,19 +1371,35 @@ async def update_task(
     담당자/관련자는 해당 프로젝트 멤버만 지정 가능.
     """
     _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
-    if (
+    task_id = await _resolve_task(ctx, task_id)
+    if parent is not None:
+        parent = await _resolve_task(ctx, parent)
+    tag_change = tags is not None or bool(add_tags) or bool(remove_tags)
+    needs_project = (
         weight is not None
         or assignee is not None
-        or participant_ids
+        or bool(participant_ids)
         or status is not None
         or priority is not None
         or task_type is not None
-    ):
-        # 태스크 상세 1회 + 프로젝트 상세 1회(TTL 캐시)로 멤버 해석·WBS 가드·enum 해석을 모두 처리
-        project_id = client.get(f"{_TASKS}{task_id}/").json().get("project")
+        or tag_change
+        or needs_vdc_share is not None
+        or title_en is not None
+    )
+    tag_ids = None
+    cur = None
+    if needs_project or is_pinned is not None:
+        # 태스크 상세 1회 + 프로젝트 상세 1회(TTL 캐시)로 멤버·WBS 가드·enum·태그·고정 판단을 모두 처리
+        cur = client.get(f"{_TASKS}{task_id}/").json()
+    if needs_project:
+        project_id = cur.get("project")
         project_json = _project(project_id)
         if weight is not None:
             _ensure_wbs_weight(project_json)
+        if needs_vdc_share is not None:
+            _ensure_not_wbs(project_json, "VDC 공유 필요(needs_vdc_share)")
+        if title_en is not None:
+            _ensure_not_wbs(project_json, "영문 제목(title_en)")
         assignee, participant_ids = _resolve_members(
             project_id, assignee, participant_ids, project=project_json
         )  # id 또는 이름
@@ -1158,6 +1410,13 @@ async def update_task(
             priority = _resolve_enum_value(project_json, "priority", priority)
         if task_type is not None:
             task_type = _resolve_enum_value(project_json, "task_type", task_type)
+        if tag_change:
+            tag_ids = _merge_tag_ids(
+                [g.get("id") for g in (cur.get("tag_list") or [])],
+                _resolve_tags(project_json, tags) if tags is not None else None,
+                _resolve_tags(project_json, add_tags),
+                _resolve_tags(project_json, remove_tags),
+            )
     if customer is not None:
         customer = _resolve_customer((await _resolve_context(ctx)).get("workspace_id"), customer)
     description = normalize_description(
@@ -1180,8 +1439,11 @@ async def update_task(
             "customer": customer,
             "parent": parent,
             "weight": weight,
-            "is_pinned": is_pinned,
             "participant_ids": participant_ids,
+            "tag_ids": tag_ids,
+            "is_report_task": is_report_task,
+            "needs_vdc_share": needs_vdc_share,
+            "title_en": title_en,
         }.items()
         if v is not None
     }
@@ -1197,17 +1459,34 @@ async def update_task(
             raise ValueError(f"같은 필드에 값과 해제를 동시에 전달할 수 없습니다: {', '.join(conflict)}")
         for f in clear_fields:
             payload[f] = None
-    if not payload:
+    if not payload and is_pinned is None:
         raise ValueError("수정할 필드를 하나 이상 전달하세요.")
-    t = client.request("PATCH", f"{_TASKS}{task_id}/", json=payload).json()
+    t = cur
+    if payload:
+        try:
+            t = client.request("PATCH", f"{_TASKS}{task_id}/", json=payload).json()
+        except httpx.HTTPStatusError as e:
+            raise _server_error(e) from e
+    # 고정은 PATCH로 보내면 서버의 5개 상한·하위/숨김 가드를 건너뛴다 → 전용 토글 액션으로, 바뀔 때만
+    if is_pinned is not None and bool(t.get("is_pinned")) != is_pinned:
+        try:
+            t = client.request("POST", f"{_TASKS}{task_id}/pin/").json()
+        except httpx.HTTPStatusError as e:
+            err = _server_error(e)
+            if payload and isinstance(err, ValueError):
+                raise ValueError(f"다른 필드는 저장됐지만 고정 변경은 실패했습니다: {err}") from e
+            raise err from e
     return {
         "id": t["id"],
+        "number": t.get("number"),
         "title": t.get("title"),
         "project_name": t.get("project_name"),
         "status": t.get("status"),
         "status_label": _STATUS_LABELS.get(t.get("status"), t.get("status")),
         "progress": t.get("progress"),
         "actual_end_date": t.get("actual_end_date"),
+        "is_pinned": t.get("is_pinned"),
+        "tags": [g.get("name") for g in (t.get("tag_list") or [])],
         "url": _task_url(t["id"]),
     }
 
@@ -1341,6 +1620,7 @@ def _related_tasks(t: dict) -> list[dict]:
     for link in t.get("outgoing_links", []) or []:
         tid = link.get("target_task")
         related.append({
+            "link_id": link.get("id"),
             "direction": "outgoing",
             "link_type": link.get("link_type"),
             "task": {
@@ -1353,6 +1633,7 @@ def _related_tasks(t: dict) -> list[dict]:
     for link in t.get("incoming_links", []) or []:
         sid = link.get("source_task")
         related.append({
+            "link_id": link.get("id"),
             "direction": "incoming",
             "link_type": link.get("link_type"),
             "task": {
@@ -1369,8 +1650,9 @@ def _related_tasks(t: dict) -> list[dict]:
 async def get_task(ctx: Context, task_id: int | str) -> dict:
     """태스크 상세를 조회한다(작업 요청 문서 생성·연동용).
 
-    task_id는 태스크 id(정수) **또는 제목(문자열)** — 제목이면 현재 프로젝트에서 검색해
-    해석한다(정확 1건이면 채택, 다수면 후보 안내, 0건이면 오류).
+    task_id는 태스크 id(정수), **'#850' 같은 #번호**, 또는 제목(문자열) — #번호·제목이면 현재 프로젝트에서
+    검색해 해석한다(정확 1건이면 채택, 다수면 후보 안내, 0건이면 오류).
+    ⚠️ 숫자만 넘기면 화면의 번호가 아니라 내부 id다 — 사용자가 "850번"이라고 하면 '#850'으로 넘긴다.
 
     제목/내용/상태/우선순위/유형/날짜/진행률/담당자 등 문서 작성에 필요한 필드와 함께
     **상위 태스크(parent)·하위 태스크(sub_tasks)·연관 태스크(related_tasks)** 를 반환한다.
@@ -1381,6 +1663,7 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
       customer/customer_name(고객사), weight(비중, WBS 전용), is_pinned(고정), participants(관련자).
       수정 전 현재 값 확인과 수정 후 반영 확인에 쓴다.
     - 그 밖에 creator_name(작성자)·tags(태그 이름)·mention_count(댓글 수)·is_archived(숨김)·
+      is_report_task(주간 회의 공유)·needs_vdc_share(VDC 공유 필요)·title_en(영문 제목)·
       created_at/updated_at을 함께 반환한다.
     - pull_requests: 연결된 GitHub PR 목록(없으면 빈 배열). 해제에 쓰는 내부 id를 함께 준다.
     - enum_mismatch: 저장된 status/priority/task_type이 **프로젝트 enum에 없을 때만** 포함되는
@@ -1423,6 +1706,9 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
         "is_pinned": t.get("is_pinned"),
         "is_archived": t.get("is_archived"),
         "tags": [g.get("name") for g in (t.get("tag_list") or [])],
+        "is_report_task": t.get("is_report_task"),
+        "needs_vdc_share": t.get("needs_vdc_share"),
+        "title_en": t.get("title_en") or None,
         "mention_count": t.get("mention_count"),
         "created_at": t.get("created_at"),
         "updated_at": t.get("updated_at"),
@@ -1435,6 +1721,164 @@ async def get_task(ctx: Context, task_id: int | str) -> dict:
     if mismatch:
         out["enum_mismatch"] = mismatch
     return out
+
+
+# --- 하위 태스크 연결 -----------------------------------------------------------
+# 연결은 일괄 변경(bulk_update) 1회로 보낸다 — 서버가 태스크별로 순환·같은 프로젝트를 검증하고
+# WBS 비중 초기화·진행률 롤업까지 처리한다. 일괄 변경은 parent=null을 받지 않으므로(일괄 해제 차단)
+# 해제는 하위마다 PATCH {parent: null}로 보낸다. 상위만 바꾸는 요청은 멤버도 허용된다(#718).
+
+
+def _brief(t: dict) -> dict:
+    return {"id": t.get("id"), "number": t.get("number"), "title": t.get("title"),
+            "url": _task_url(t["id"]) if t.get("id") else None}
+
+
+async def _resolve_task_ids(ctx: Context, values: list[int | str], label: str) -> list[int]:
+    """태스크 식별자 목록을 id 목록으로(중복 제거, 순서 유지). 서버 일괄 API 상한 100건."""
+    if not values:
+        raise ValueError(f"{label}을(를) 하나 이상 지정하세요.")
+    ids: list[int] = []
+    for v in values:
+        tid = await _resolve_task(ctx, v)
+        if tid not in ids:
+            ids.append(tid)
+    if len(ids) > 100:
+        raise ValueError(f"{label}은(는) 한 번에 100건까지 처리할 수 있습니다.")
+    return ids
+
+
+@mcp.tool
+async def link_subtasks(ctx: Context, parent: int | str, children: list[int | str]) -> dict:
+    """이미 있는 태스크들을 한 상위 태스크의 **하위 태스크로 연결**한다(새로 만들지 않는다 — 새 하위는 create_task(parent=)).
+
+    parent·children은 태스크 id(정수), **'#850' 같은 #번호**, 또는 제목 — #번호·제목은 현재 프로젝트에서
+    해석한다. 숫자만 넘기면 화면의 번호가 아니라 내부 id다.
+    - 다른 상위 아래에 있던 태스크는 이 상위 아래로 **옮겨진다**.
+    - 상위와 하위는 **같은 프로젝트**여야 하고, 자기 자신·자기 하위를 상위로 둘 수 없다(서버 검증).
+    - WBS 프로젝트는 옮겨진 태스크의 비중(weight)이 **초기화**된다. 상위 진행률은 하위 비중 가중평균이라
+      비중 합이 0이면 **상위 진행률이 0이 된다**(서버 정책) → 연결 후 update_task(weight=)로 하위 비중을
+      다시 지정하라고 안내한다(형제 합 100 이하).
+    - 태스크별로 따로 적용된다 — 일부만 실패하면 linked/failed(사유 포함)로 나눠 돌려준다.
+    떼어내려면 unlink_subtasks.
+    """
+    parent_id = await _resolve_task(ctx, parent)
+    child_ids = await _resolve_task_ids(ctx, children, "하위로 연결할 태스크")
+    if parent_id in child_ids:
+        raise ValueError("상위 태스크 자신을 하위로 지정할 수 없습니다.")
+    try:
+        p = client.get(f"{_TASKS}{parent_id}/").json()  # 존재·접근 확인 + 결과 표시용
+        data = client.request(
+            "POST", f"{_TASKS}bulk_update/",
+            json={"task_ids": child_ids, "fields": {"parent": parent_id}},
+        ).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return {
+        "parent": _brief(p),
+        "linked": [_brief(t) for t in data.get("updated", [])],
+        "failed": data.get("failed", []),
+    }
+
+
+@mcp.tool
+async def unlink_subtasks(ctx: Context, children: list[int | str]) -> dict:
+    """하위 태스크를 상위에서 **떼어내 최상위 태스크로** 만든다(태스크 자체는 지우지 않는다).
+
+    children은 태스크 id(정수), **'#850' 같은 #번호**, 또는 제목 — #번호·제목은 현재 프로젝트에서 해석한다.
+    태스크마다 따로 처리해 일부만 실패하면 unlinked/failed(사유 포함)로 나눠 돌려준다.
+    WBS 프로젝트는 비중(weight)이 초기화되고 옛 상위 진행률이 다시 계산된다.
+    """
+    child_ids = await _resolve_task_ids(ctx, children, "떼어낼 태스크")
+    unlinked, failed = [], []
+    for cid in child_ids:
+        try:
+            t = client.request("PATCH", f"{_TASKS}{cid}/", json={"parent": None}).json()
+            unlinked.append(_brief(t))
+        except httpx.HTTPStatusError as e:
+            failed.append({"id": cid, "reason": str(_server_error(e))})
+    return {"unlinked": unlinked, "failed": failed}
+
+
+# --- 연관 태스크 연결 -----------------------------------------------------------
+_LINKS = "/api/tasks/links/"
+
+
+@mcp.tool
+async def link_tasks(
+    ctx: Context, task: int | str, targets: list[int | str], link_type: str = "related"
+) -> dict:
+    """태스크에 **연관 태스크**를 연결한다(상위·하위 관계가 아닌 '관련/차단' 관계).
+
+    - task·targets: 태스크 id(정수), **'#850' 같은 #번호**, 또는 제목 — #번호·제목은 현재 프로젝트에서
+      해석한다. **같은 워크스페이스의 다른 프로젝트 태스크**도 연결할 수 있다(그때는 내부 id로 지정).
+    - link_type(방향은 task → 대상 기준): related(관련, 기본) / blocks(차단 — task가 대상을 막음) /
+      blocked_by(차단됨 — task가 대상에 막힘). 한글 라벨도 된다.
+    - 자기 자신·이미 연결된 대상·볼 수 없는 대상은 건너뛰고 failed(사유)로 돌려준다.
+    현재 연관 목록은 get_task의 related_tasks, 끊기는 unlink_tasks.
+    """
+    code = _resolve_link_type(link_type)
+    source_id = await _resolve_task(ctx, task)
+    target_ids = await _resolve_task_ids(ctx, targets, "연결할 대상 태스크")
+    try:
+        data = client.request(
+            "POST", f"{_LINKS}bulk_create/",
+            json={"source_task": source_id, "link_type": code, "target_task_ids": target_ids},
+        ).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return {
+        "task_id": source_id,
+        "link_type": code,
+        "link_type_label": _LINK_TYPE_LABELS[code],
+        "created": [
+            {
+                "link_id": c.get("id"),
+                "task": {
+                    "id": c.get("target_task"),
+                    "number": c.get("target_task_number"),
+                    "title": c.get("target_task_title"),
+                    "project_name": c.get("target_task_project_name"),
+                    "url": _task_url(c["target_task"]) if c.get("target_task") else None,
+                },
+            }
+            for c in data.get("created", [])
+        ],
+        "failed": data.get("failed", []),
+    }
+
+
+@mcp.tool
+async def unlink_tasks(ctx: Context, task: int | str, targets: list[int | str]) -> dict:
+    """태스크와 대상 태스크들 사이의 **연관 연결을 끊는다**(방향·유형과 무관하게 둘 사이 연결을 찾아 삭제).
+
+    task·targets는 태스크 id(정수), **'#850' 같은 #번호**, 또는 제목 — #번호·제목은 현재 프로젝트에서 해석한다.
+    연결이 없던 대상은 not_linked, 권한이 없는 연결(상대 프로젝트가 만든 연결 등)은 failed(사유)로 돌려준다.
+    """
+    source_id = await _resolve_task(ctx, task)
+    target_ids = await _resolve_task_ids(ctx, targets, "연결을 끊을 대상 태스크")
+    t = client.get(f"{_TASKS}{source_id}/").json()
+    found: dict[int, list[int]] = {}
+    for link in t.get("outgoing_links") or []:
+        if link.get("target_task") in target_ids:
+            found.setdefault(link["target_task"], []).append(link["id"])
+    for link in t.get("incoming_links") or []:
+        if link.get("source_task") in target_ids:
+            found.setdefault(link["source_task"], []).append(link["id"])
+    unlinked, failed = [], []
+    for other, link_ids in found.items():
+        for lid in link_ids:
+            try:
+                client.request("DELETE", f"{_LINKS}{lid}/")
+                unlinked.append({"task_id": other, "link_id": lid})
+            except httpx.HTTPStatusError as e:
+                failed.append({"task_id": other, "link_id": lid, "reason": str(_server_error(e))})
+    return {
+        "task_id": source_id,
+        "unlinked": unlinked,
+        "not_linked": [tid for tid in target_ids if tid not in found],
+        "failed": failed,
+    }
 
 
 # --- GitHub PR 연결 ------------------------------------------------------------
@@ -1844,6 +2288,7 @@ async def task_from_doc(
     """작업 요청 문서로 태스크를 생성하고, 문서 frontmatter에 task_id/task_url을 기록한다.
 
     - 제목: 문서의 첫 '# ' 헤딩에서 추출.
+    - 고객사: 프로젝트 설정 '태스크 고객사 자동 지정'이 켜진 비WBS 프로젝트면 프로젝트 고객사가 들어간다(웹과 동일).
     - description(필수): 호출하는 에이전트가 아래 라벨 섹션 템플릿(평문)으로 작성해 전달한다.
       도구가 GDC 리치텍스트(HTML)로 변환해 저장한다(라벨→문단, 블렛→목록, 섹션 사이 빈 문단).
         [요약]
@@ -1920,6 +2365,7 @@ async def task_from_doc(
         "priority": priority,
         "task_type": task_type,
         "assignee": _current_user_id(),  # 기본 담당자 = 로그인 사용자
+        "customer": _auto_customer(project_json),  # 프로젝트 고객사 자동 지정(#838, create_task와 동일)
     }
     # 완료 상태로 생성 시 진행률/실제 종료일 자동 보정
     if status and _status_category(project, status, project=project_json) == "done":
@@ -2172,6 +2618,12 @@ def _find_trashed(items: list[dict], id_or_title: int | str) -> tuple[int, dict 
     title = str(id_or_title).strip()
     if not title:
         raise ValueError("복구할 태스크의 id 또는 제목을 입력하세요.")
+    number = _parse_task_number(title)
+    if number is not None:
+        hit = next((r for r in items if r.get("number") == number), None)
+        if hit is None:
+            raise ValueError(f"현재 프로젝트 휴지통에 #{number} 태스크가 없습니다. list_trashed_tasks로 확인하세요.")
+        return hit["id"], hit
     exact = [r for r in items if str(r.get("title", "")).strip().lower() == title.lower()]
     candidates = exact or [
         r for r in items if title.lower() in str(r.get("title", "")).strip().lower()
@@ -2538,7 +2990,7 @@ _SUGGESTION_CATEGORY_LABELS = {
 }
 _SUGGESTION_STATUS_LABELS = {
     "received": "접수", "reviewing": "검토중", "planned": "반영예정",
-    "completed": "반영완료", "hold": "보류", "rejected": "반려",
+    "completed": "반영완료", "answered": "답변완료", "hold": "보류", "rejected": "반려",
 }
 
 _SUGGESTION_CONTENT_MIN = 5
@@ -2670,7 +3122,7 @@ def list_my_suggestions(
     """내가 제출한 건의사항 목록을 최신순으로 조회한다(조회 전용).
 
     - status: received(접수)/reviewing(검토중)/planned(반영예정)/completed(반영완료)/
-      hold(보류)/rejected(반려). 한글 라벨도 해석한다.
+      answered(답변완료)/hold(보류)/rejected(반려). 한글 라벨도 해석한다.
     - category: bug/feature/improvement/other (한글 라벨 허용).
     - limit: 최대 건수(기본 20). 서버 페이지가 20건 고정이라 초과분은 page를 넘겨 모은다.
     목록에는 **본문·관리자 답변이 없다** — has_reply가 true인 건을 get_suggestion(id)로 열어본다.
@@ -2830,6 +3282,7 @@ def gdc_task_new(request: str = "") -> str:
         "원칙:\n"
         "- 자유 입력은 제목·내용(description)·예상 시작일·예상 종료일 뿐. 상태/우선순위/업무유형/관련자는 선택 목록으로 고릅니다.\n"
         "- 담당자는 묻지 않습니다(로그인 사용자로 자동 등록).\n"
+        "- 태그·주간 회의 공유는 묻지 않고, 사용자가 말한 경우에만 넘깁니다(태그는 `get_project_enums`의 tags 이름 → `tags`, 주간 회의 공유 → `is_report_task=True`).\n"
         "- ⚠️ 모든 선택 질문에 반드시 '건너뛰기' 보기를 포함(생략 금지). 실제 값 보기는 최대 3개, 나머지는 '기타(Other)'로.\n\n"
         "절차:\n"
         "1. `get_context`로 현재 레포의 project_id 확인(없으면 gdc_login 안내).\n"
@@ -2955,7 +3408,8 @@ def _apply_steps(include_fetch: bool = True, prefix: str = "") -> str:
         "   ② 댓글 — `add_task_comment`에 `[추가 (YYYY-MM-DD)]` 라벨 + 블렛.\n"
         "   ③ 하위 태스크 — `create_task(parent=task_id, ...)`. 이때 description은 평문 한 문단으로 넣지 말고 "
         "`gdc_task_new`의 **라벨 섹션 템플릿(평문)**을 따릅니다: `[요약]` 한두 줄 → (선택·짝) `[AS-IS]`/`[TO-BE]` → "
-        "`[작업 내용]` 아래 `-` 블렛(각 한 줄). 체크박스·프로세스 메타 단계(빌드/검증/테스트/커밋/배포/버전 범프)는 제외합니다.",
+        "`[작업 내용]` 아래 `-` 블렛(각 한 줄). 체크박스·프로세스 메타 단계(빌드/검증/테스트/커밋/배포/버전 범프)는 제외합니다. "
+        "이미 있는 태스크를 하위로 붙이는 경우면 새로 만들지 말고 `link_subtasks(parent=task_id, children=[...])`를 씁니다.",
         "**내용 변경**이면 AskUserQuestion으로 묻습니다:\n"
         "   ① 본문만 최신화 — `edit_task_description(task_id, mode='replace_section', label='<라벨>', "
         "new_body_html='<본문HTML>')`로 해당 라벨 섹션만 교체.\n"
