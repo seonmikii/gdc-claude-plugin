@@ -3207,6 +3207,1173 @@ def get_suggestion(suggestion_id: int) -> dict:
 # Claude Code에서는 /mcp__gdc-local__gdc_* 로, Desktop에서는 "+" 메뉴로 노출된다.
 
 
+# ==============================================================================
+# 2차(#850) — 주간 업무 · 캘린더/일정 · 리소스 예약 · 프로젝트 이동 · 일괄 변경 · 고객 접수
+# 모두 워크스페이스 단위 기능이라 현재 레포 컨텍스트의 workspace_id를 쓴다.
+# ==============================================================================
+
+
+async def _workspace_id(ctx: Context | None) -> int:
+    ws = (await _resolve_context(ctx)).get("workspace_id")
+    if ws is None:
+        raise ValueError("워크스페이스가 설정되지 않았습니다. gdc_login 또는 set_context로 선택하세요.")
+    return ws
+
+
+def _results(data) -> list:
+    """목록 응답이 배열이든 페이지({results})든 항목 배열로."""
+    if isinstance(data, dict):
+        return data.get("results", [])
+    return data or []
+
+
+def _get_all_pages(path: str, params: dict, max_items: int = 200) -> list:
+    """page_size 파라미터가 없는(20건 고정) 목록을 page로 넘기며 max_items까지 모은다."""
+    items: list = []
+    page = 1
+    while len(items) < max_items:
+        data = client.get(path, params={**params, "page": page}).json()
+        batch = _results(data)
+        items += batch
+        if not isinstance(data, dict) or not data.get("next") or not batch:
+            break
+        page += 1
+    return items[:max_items]
+
+
+# --- 워크스페이스 멤버 (일정 참석자·예약 참석자·고객 접수 담당자 해석) ------------
+_WS_MEMBERS_CACHE: dict[int, tuple[float, list]] = {}
+_ME_WORDS = {"me", "나", "내", "본인"}
+
+
+def _workspace_members(ws_id: int) -> list[dict]:
+    hit = _WS_MEMBERS_CACHE.get(ws_id)
+    if hit and time.monotonic() - hit[0] < _PROJECT_TTL:
+        return hit[1]
+    members = _get_all_pages(f"/api/workspaces/{ws_id}/members/", {"active": "true"}, max_items=2000)
+    _WS_MEMBERS_CACHE[ws_id] = (time.monotonic(), members)
+    return members
+
+
+def _match_user(members: list[dict], value: int | str, label: str) -> int:
+    """user id·이름(full_name/username)·'나'를 워크스페이스 멤버 user id로."""
+    if isinstance(value, str) and value.strip().lower() in _ME_WORDS:
+        me = _current_user_id()
+        if me is None:
+            raise ValueError("로그인 사용자를 확인할 수 없습니다. gdc_login으로 다시 인증하세요.")
+        return me
+    ids = {m.get("user") for m in members}
+    if not isinstance(value, bool) and (isinstance(value, int) or str(value).strip().isdigit()):
+        if int(value) in ids:
+            return int(value)
+    else:
+        v = str(value).strip().lower()
+        hits = {m.get("user") for m in members
+                if v in (str(m.get("full_name") or "").strip().lower(), str(m.get("username") or "").strip().lower())}
+        if len(hits) == 1:
+            return hits.pop()
+        if len(hits) > 1:
+            raise ValueError(f"{label} '{value}'과(와) 이름이 같은 멤버가 여럿입니다. user id로 지정하세요.")
+    raise ValueError(f"{label} '{value}'은(는) 이 워크스페이스의 멤버가 아닙니다.")
+
+
+def _resolve_ws_users(ws_id: int, values: list[int | str] | None, label: str) -> list[int] | None:
+    if values is None:
+        return None
+    members = _workspace_members(ws_id) if values else []
+    out: list[int] = []
+    for v in values:
+        uid = _match_user(members, v, label)
+        if uid not in out:
+            out.append(uid)
+    return out
+
+
+def _names(users: list[dict] | None) -> list[str]:
+    # 사용자 요약은 응답마다 이름 키가 다르다 — MentionedUser는 full_name/username, 캘린더 assignees는 name
+    return [u.get("full_name") or u.get("name") or u.get("username") or str(u.get("id")) for u in (users or [])]
+
+
+def _drop_empty(d: dict) -> dict:
+    """None·빈 문자열·빈 목록·False를 뺀다(0은 남긴다 — `0 == False`라 `in`으로 거르면 진행률 0이 사라진다)."""
+    return {k: v for k, v in d.items() if not (v is None or v is False or v == "" or v == [])}
+
+
+# --- 주간 업무 (C1) ---------------------------------------------------------------
+_CHIP_LABELS = {"planned": "예정", "in_progress": "진행", "done": "완료"}
+_RISK_LABELS = {"DELAYED": "지연", "URGENT": "긴급", "ON_TRACK": "정상"}
+_WEEK_BUCKETS = (("last_week", "저번주"), ("this_week", "이번주"), ("risk", "리스크"), ("undated", "날짜 미정"))
+
+
+def _weekly_item(x: dict) -> dict:
+    return _drop_empty({
+        "number": x.get("number"),
+        "title": x.get("title"),
+        "assignee_name": x.get("assignee_name"),
+        "status": _CHIP_LABELS.get(x.get("status_chip"), x.get("status_chip")),
+        "progress": x.get("progress"),
+        "days_overdue": x.get("days_overdue"),
+        "is_urgent": x.get("is_urgent"),
+        "is_report_task": x.get("is_report_task"),
+        "customer_name": x.get("customer_name"),
+        "url": _task_url(x["id"]),
+    })
+
+
+def _shape_weekly(data: dict, project_id: int | None, assignee_id: int | None) -> dict:
+    """주간 업무 버킷 응답을 프로젝트·담당자로 추리고 표시용으로 압축한다(네트워크 없음)."""
+    projects = []
+    for p in data.get("projects", []):
+        if project_id is not None and p.get("id") != project_id:
+            continue
+        buckets = {}
+        for key, label in _WEEK_BUCKETS:
+            items = [x for x in p.get(key, []) if assignee_id is None or x.get("assignee_id") == assignee_id]
+            buckets[label] = [_weekly_item(x) for x in items]
+        if project_id is None and not any(buckets.values()):
+            continue  # 전체 보기에서는 빈 프로젝트를 뺀다
+        projects.append({
+            "project_id": p.get("id"),
+            "project_name": p.get("name"),
+            "customer_name": p.get("customer_name") or None,
+            "risk": _RISK_LABELS.get(p.get("risk_status"), p.get("risk_status")),
+            **buckets,
+        })
+    return {
+        "week_start": data.get("week_start"),
+        "week_end": data.get("week_end"),
+        "workspace_summary": {
+            "active_projects": (data.get("summary") or {}).get("active_project_count"),
+            "completed_this_week": (data.get("summary") or {}).get("completed_count"),
+            "delayed": (data.get("summary") or {}).get("delayed_count"),
+        },
+        "projects": projects,
+    }
+
+
+@mcp.tool
+async def get_weekly_sync(
+    ctx: Context,
+    week: str | None = None,
+    all_projects: bool = False,
+    my_projects_only: bool = False,
+    assignee: int | str | None = None,
+) -> dict:
+    """주간 업무(웹 '주간 업무' 화면)를 조회한다 — 저번주/이번주/리스크/날짜 미정 버킷.
+
+    ⚠️ 서버 정책상 **워크스페이스 관리자 이상만** 볼 수 있다(아니면 권한 안내).
+    - week: 그 주에 속한 아무 날짜(YYYY-MM-DD). 생략하면 이번 주. 주는 월~일.
+    - 기본은 **현재 레포 프로젝트만** 보여준다. all_projects=True면 워크스페이스 전체 프로젝트
+      (태스크가 하나도 없는 프로젝트는 생략). my_projects_only=True면 내가 멤버인 프로젝트만.
+    - assignee: 담당자로 거르기 — user id·이름·'나'.
+    - 각 태스크: 번호·제목·담당자·상태(예정/진행/완료 — 저번주·이번주는 **그 주가 끝난 시점 값**)·진행률·
+      지연 일수·긴급 여부·주간 회의 공유 여부. 백로그 상태와 종료된 프로젝트는 서버가 뺀다.
+    - workspace_summary는 화면 상단 집계(워크스페이스 기준 — 프로젝트 필터와 무관).
+    """
+    ws = await _workspace_id(ctx)
+    params: dict[str, str | int] = {"workspace": ws, "view": "buckets"}
+    if week:
+        _parse_date(week, "week")
+        params["start_date"] = week
+    if my_projects_only:
+        params["my_projects_only"] = "true"
+    project_id = None
+    if not all_projects:
+        project_id = (await _resolve_context(ctx)).get("project_id")
+    assignee_id = _match_user(_workspace_members(ws), assignee, "담당자") if assignee is not None else None
+    try:
+        data = client.get("/api/dashboard/weekly-sync/", params=params).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return _shape_weekly(data, project_id, assignee_id)
+
+
+# --- 캘린더 (C2) ------------------------------------------------------------------
+_CAL_SOURCES = {"task": "태스크", "customer_issue": "고객 접수", "schedule": "일정", "reservation": "예약"}
+_CAL_MAX_DAYS = 92
+
+
+def _resolve_cal_sources(values: list[str] | None) -> list[str] | None:
+    if not values:
+        return None
+    aliases = {**{c: c for c in _CAL_SOURCES}, **{l: c for c, l in _CAL_SOURCES.items()},
+               "고객 이슈": "customer_issue", "이슈": "customer_issue", "리소스 예약": "reservation"}
+    out = []
+    for v in values:
+        code = aliases.get(str(v).strip().lower())
+        if code is None:
+            raise ValueError(
+                f"캘린더 종류 '{v}'은(는) 지원하지 않습니다. 가능한 값: "
+                + ", ".join(f"{c}({l})" for c, l in _CAL_SOURCES.items())
+            )
+        if code not in out:
+            out.append(code)
+    return out
+
+
+def _issue_url(customer_id, issue_id) -> str | None:
+    if not customer_id or not issue_id:
+        return None
+    return f"{_WEB_URL}/customers/{customer_id}/issues/{issue_id}"
+
+
+def _collapse_calendar(items: list[dict]) -> list[dict]:
+    """날짜별로 펼친 캘린더 응답을 항목 하나씩으로 접는다(네트워크 없음).
+
+    서버 `key`는 펼친 날짜마다 달라(여러 날 일정이 날마다 다른 key) 묶음 기준이 못 된다 — (종류, id)로 묶는다.
+    반복 예약은 회차마다 id가 달라 그대로 따로 남는다.
+    """
+    seen: dict[tuple, dict] = {}
+    for it in items:
+        key = (it.get("source"), it.get("id"))
+        cur = seen.get(key)
+        d = it.get("date")
+        if cur is None:
+            seen[key] = cur = {"item": it, "first": d, "last": d}
+        else:
+            cur["first"], cur["last"] = min(cur["first"], d), max(cur["last"], d)
+    out = []
+    for v in seen.values():
+        it = v["item"]
+        src = it.get("source")
+        start = it.get("start_date") or v["first"]
+        end = it.get("end_date") or v["last"]
+        url = None
+        if src == "task":
+            url = _task_url(it["id"])
+        elif src == "customer_issue":
+            url = _issue_url(it.get("customer_id"), it.get("id"))
+        people = _names(it.get("assignees")) or ([it["assignee_name"]] if it.get("assignee_name") else [])
+        out.append(_drop_empty({
+            "source": _CAL_SOURCES.get(src, src),
+            "id": it.get("id"),
+            "number": it.get("number"),
+            "title": it.get("title"),
+            "start": start,
+            "end": end if end != start else None,
+            "time": (f"{(it.get('start_time') or '')[:5]}~{(it.get('end_time') or '')[:5]}"
+                     if not it.get("all_day", True) and it.get("start_time") else None),
+            "project_name": it.get("project_name"),
+            "customer_name": it.get("customer_name"),
+            "people": people,
+            "category": it.get("category"),
+            "is_overdue": it.get("is_overdue"),
+            "url": url,
+        }))
+    out.sort(key=lambda x: (x.get("start") or "", x.get("source") or "", x.get("number") or 0))
+    return out
+
+
+@mcp.tool
+async def get_calendar(
+    ctx: Context,
+    start: str,
+    end: str | None = None,
+    sources: list[str] | None = None,
+    mine: bool = False,
+    current_project_only: bool = False,
+    assignee: int | str | None = None,
+) -> dict:
+    """통합 캘린더(웹 '캘린더' 화면)를 기간으로 조회한다 — 태스크·고객 접수·일정·리소스 예약.
+
+    - start/end: YYYY-MM-DD(end 생략 시 하루). 최대 92일.
+    - 태스크·고객 접수는 **계획 종료일**(실제 종료일 우선) 하루에, 일정·예약은 기간 전체에 걸쳐 나온다 —
+      응답은 항목 하나당 한 줄로 접어 start~end로 보여준다.
+    - sources: task(태스크)/customer_issue(고객 접수)/schedule(일정)/reservation(예약) 중 고르기(기본 전체).
+    - mine=True: 내 항목만(일정·예약은 작성자이거나 참석자). current_project_only=True: 현재 프로젝트 태스크·
+      그 프로젝트에 연결된 일정만. assignee: 담당자(일정·예약은 참석자) — user id·이름·'나'.
+    일정 id는 update_schedule/delete_schedule, 예약 id는 update_reservation/cancel_reservation에 쓴다.
+    """
+    ws = await _workspace_id(ctx)
+    end = end or start
+    s, e = _parse_date(start, "start"), _parse_date(end, "end")
+    if s > e:
+        raise ValueError(f"start({start})는 end({end})보다 늦을 수 없습니다.")
+    if (e - s).days + 1 > _CAL_MAX_DAYS:
+        raise ValueError(f"캘린더는 한 번에 {_CAL_MAX_DAYS}일까지 조회할 수 있습니다.")
+    params: dict[str, str | int] = {"workspace": ws, "start": start, "end": end}
+    codes = _resolve_cal_sources(sources)
+    if codes:
+        params["sources"] = ",".join(codes)
+    if mine:
+        params["mine"] = "true"
+    if current_project_only:
+        pid = (await _resolve_context(ctx)).get("project_id")
+        if pid is None:
+            raise ValueError("프로젝트가 설정되지 않았습니다. gdc_login 또는 set_context로 선택하세요.")
+        params["project"] = pid
+    if assignee is not None:
+        params["assignee"] = _match_user(_workspace_members(ws), assignee, "담당자")
+    try:
+        data = client.get("/api/dashboard/calendar/", params=params).json()
+    except httpx.HTTPStatusError as ex:
+        raise _server_error(ex) from ex
+    items = _collapse_calendar(data.get("items", []))
+    return {"start": start, "end": end, "count": len(items), "items": items}
+
+
+# --- 일정 (C3) --------------------------------------------------------------------
+_SCHEDULES = "/api/schedules/"
+_SCHEDULE_KINDS = {"field_work": "외근", "vacation": "휴가", "external": "외부 일정"}
+
+
+def _resolve_schedule_kind(value: str | None) -> str | None:
+    """일정 종류(코드·한글) → 서버 코드. None=미전달, ''/'일반'=종류 없음."""
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if v in ("", "일반", "none", "없음"):
+        return ""
+    for code, label in _SCHEDULE_KINDS.items():
+        if v in (code, label, label.replace(" ", "")):
+            return code
+    raise ValueError(
+        f"일정 종류 '{value}'은(는) 지원하지 않습니다. 가능한 값: "
+        + ", ".join(f"{c}({l})" for c, l in _SCHEDULE_KINDS.items()) + ", 일반(종류 없음)"
+    )
+
+
+def _check_range(start: str | None, end: str | None, label: str) -> None:
+    if start and end and _parse_date(start, f"{label} 시작일") > _parse_date(end, f"{label} 종료일"):
+        raise ValueError(f"{label} 종료일({end})은 시작일({start})보다 빠를 수 없습니다.")
+    for v in (start, end):
+        if v:
+            _parse_date(v, label)
+
+
+_HHMM_RE = re.compile(r"([01]?\d|2[0-3]):([0-5]\d)")
+
+
+def _parse_hhmm(value: str, label: str) -> str:
+    m = _HHMM_RE.fullmatch(str(value).strip())
+    if not m:
+        raise ValueError(f"{label} '{value}'은(는) HH:MM 형식이어야 합니다(예: 09:30).")
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def _schedule_summary(s: dict) -> dict:
+    return _drop_empty({
+        "id": s.get("id"),
+        "title": s.get("title"),
+        "kind": _SCHEDULE_KINDS.get(s.get("kind"), s.get("kind")),
+        "start_date": s.get("start_date"),
+        "end_date": s.get("end_date") if s.get("end_date") != s.get("start_date") else None,
+        "time": (f"{(s.get('start_time') or '')[:5]}~{(s.get('end_time') or '')[:5]}"
+                 if not s.get("all_day", True) else None),
+        "all_day": s.get("all_day"),
+        "project_name": s.get("project_name"),
+        "participants": _names(s.get("participants_detail")),
+        "memo": s.get("memo"),
+        "creator_name": s.get("creator_name"),
+    })
+
+
+async def _schedule_project(ctx: Context, project: int | str | None) -> int | None:
+    if project is None:
+        return None
+    if isinstance(project, str) and project.strip() in ("current", "현재", "현재 프로젝트"):
+        pid = (await _resolve_context(ctx)).get("project_id")
+        if pid is None:
+            raise ValueError("프로젝트가 설정되지 않았습니다. 프로젝트 id로 지정하세요.")
+        return pid
+    if not isinstance(project, bool) and (isinstance(project, int) or str(project).strip().isdigit()):
+        return int(project)
+    raise ValueError("project는 프로젝트 id 또는 'current'(현재 레포 프로젝트)로 지정하세요.")
+
+
+def _schedule_times(
+    all_day: bool | None, start_time: str | None, end_time: str | None
+) -> tuple[bool | None, str | None, str | None]:
+    """시각을 주면 종일 아님으로 본다. 종일과 시각을 함께 주면 오류."""
+    st = _parse_hhmm(start_time, "시작 시각") if start_time else None
+    et = _parse_hhmm(end_time, "종료 시각") if end_time else None
+    if all_day and (st or et):
+        raise ValueError("종일 일정(all_day=True)에는 시각을 줄 수 없습니다.")
+    if all_day is None and (st or et):
+        all_day = False
+    return all_day, st, et
+
+
+@mcp.tool
+async def create_schedule(
+    ctx: Context,
+    title: str,
+    start_date: str,
+    end_date: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    all_day: bool | None = None,
+    kind: str | None = None,
+    memo: str | None = None,
+    participants: list[int | str] | None = None,
+    project: int | str | None = None,
+) -> dict:
+    """캘린더에 일정을 만든다(현재 워크스페이스). 태스크와 무관한 외근·휴가·외부 일정·회의 등.
+
+    - start_date/end_date: YYYY-MM-DD(end 생략 시 하루). 시각(HH:MM)을 주면 종일이 아닌 일정 —
+      이때는 start_time·end_time 둘 다 필요하다(같은 날이면 종료가 시작보다 늦어야 함).
+    - kind: 외근(field_work)/휴가(vacation)/외부 일정(external)/생략(일반).
+    - participants: 참석자 — 워크스페이스 멤버 user id·이름·'나'.
+    - project: 연결할 프로젝트 id 또는 'current'(현재 레포 프로젝트). 생략하면 연결 없음.
+    """
+    ws = await _workspace_id(ctx)
+    end_date = end_date or start_date
+    _check_range(start_date, end_date, "일정")
+    all_day, st, et = _schedule_times(all_day, start_time, end_time)
+    payload = _drop_empty({
+        "workspace": ws,
+        "title": title,
+        "kind": _resolve_schedule_kind(kind),
+        "memo": memo,
+        "start_date": start_date,
+        "end_date": end_date,
+        "start_time": st,
+        "end_time": et,
+        "participants": _resolve_ws_users(ws, participants, "참석자"),
+        "project": await _schedule_project(ctx, project),
+    })
+    payload["all_day"] = True if all_day is None else all_day
+    try:
+        s = client.request("POST", _SCHEDULES, json=payload).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return _schedule_summary(s)
+
+
+@mcp.tool
+async def update_schedule(
+    ctx: Context,
+    schedule_id: int,
+    title: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    all_day: bool | None = None,
+    kind: str | None = None,
+    memo: str | None = None,
+    participants: list[int | str] | None = None,
+    project: int | str | None = None,
+    clear_project: bool = False,
+) -> dict:
+    """일정을 부분 수정한다. schedule_id는 get_calendar 결과(source=일정)의 id.
+
+    전달한 값만 바뀐다. 시각을 주면 종일이 아닌 일정으로 바뀌고, all_day=True면 시각이 지워진다.
+    kind='일반'이면 종류를 비운다. participants=[]면 참석자 전체 해제. clear_project=True면 프로젝트 연결 해제.
+    수정 권한은 서버 규칙(작성자·참석자 등 워크스페이스 권한 설정)을 따른다.
+    """
+    ws = await _workspace_id(ctx)
+    _check_range(start_date, end_date, "일정")
+    all_day, st, et = _schedule_times(all_day, start_time, end_time)
+    payload = {k: v for k, v in {
+        "title": title,
+        "kind": _resolve_schedule_kind(kind),
+        "memo": memo,
+        "start_date": start_date,
+        "end_date": end_date,
+        "start_time": st,
+        "end_time": et,
+        "all_day": all_day,
+        "participants": _resolve_ws_users(ws, participants, "참석자"),
+        "project": await _schedule_project(ctx, project),
+    }.items() if v is not None}
+    if clear_project:
+        if "project" in payload:
+            raise ValueError("project와 clear_project를 함께 쓸 수 없습니다.")
+        payload["project"] = None
+    if not payload:
+        raise ValueError("수정할 값을 하나 이상 전달하세요.")
+    try:
+        s = client.request("PATCH", f"{_SCHEDULES}{schedule_id}/", json=payload).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return _schedule_summary(s)
+
+
+@mcp.tool
+def delete_schedule(schedule_id: int, confirm: bool = False) -> dict:
+    """일정을 삭제한다. confirm=False(기본)면 대상만 미리 보여주고, confirm=True로 다시 호출해야 삭제한다."""
+    try:
+        s = client.get(f"{_SCHEDULES}{schedule_id}/").json()
+        if not confirm:
+            return {"confirm_required": True,
+                    "message": f"일정 '{s.get('title')}'을(를) 삭제합니다. confirm=true로 다시 호출하세요.",
+                    "schedule": _schedule_summary(s)}
+        client.request("DELETE", f"{_SCHEDULES}{schedule_id}/")
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return {"deleted": True, "schedule": _schedule_summary(s)}
+
+
+# --- 리소스 예약 (C4) ----------------------------------------------------------------
+_RESERVATIONS = "/api/reservations/"
+_RESOURCE_TYPES = {"space": "공간", "equipment": "장비"}
+_RECURRENCES = {"daily": "매일", "weekly": "매주", "biweekly": "2주마다", "monthly": "매월"}
+# 서버가 문구 대신 코드로 내려주는 예약 오류(reservations/views.py) — 프론트 i18n과 같은 뜻으로 옮긴다.
+_RESERVATION_CODES = {
+    "past": "지난 시각에는 예약할 수 없습니다(지금 30분 칸부터 가능).",
+    "too_far": "오늘부터 12주 뒤까지만 예약할 수 있습니다.",
+    "inactive": "사용 중지된 리소스입니다.",
+    "disabled": "이 워크스페이스는 리소스 예약 기능이 꺼져 있습니다.",
+    "ended": "이미 끝난 예약은 바꾸거나 취소할 수 없습니다.",
+}
+_DT_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{1,2}:\d{2})")
+
+
+def _parse_dt(value: str, label: str) -> str:
+    """'YYYY-MM-DD HH:MM' 또는 'YYYY-MM-DDTHH:MM' → 서버 형식(시간대 없음 = 서울 시각)."""
+    m = _DT_RE.fullmatch(str(value).strip())
+    if not m:
+        raise ValueError(f"{label} '{value}'은(는) 'YYYY-MM-DD HH:MM' 형식이어야 합니다.")
+    _parse_date(m.group(1), label)
+    return f"{m.group(1)}T{_parse_hhmm(m.group(2), label)}"
+
+
+def _reservation_error(e: httpx.HTTPStatusError) -> Exception:
+    """예약 오류: 409 충돌은 겹치는 예약을, 400 코드는 한글 안내로."""
+    if e.response.status_code == 409:
+        try:
+            conflicts = e.response.json().get("conflicts", [])
+        except ValueError:
+            conflicts = []
+        lines = []
+        for c in conflicts[:5]:
+            others = ", ".join(
+                f"'{r.get('title') or '(제목 없음)'}' {r.get('start_at', '')[11:16]}~{r.get('end_at', '')[11:16]}"
+                for r in c.get("reservations", [])
+            )
+            lines.append(f"{c.get('start_at', '')[:16].replace('T', ' ')} — 남은 수량 {c.get('remaining')}, 겹침: {others}")
+        return ValueError("이미 예약된 시간과 겹칩니다.\n" + "\n".join(lines))
+    if e.response.status_code == 400:
+        try:
+            body = e.response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            for v in body.values():
+                first = v[0] if isinstance(v, list) and v else v
+                if isinstance(first, str) and first in _RESERVATION_CODES:
+                    return ValueError(_RESERVATION_CODES[first])
+    return _server_error(e)
+
+
+def _resources(ws: int) -> list[dict]:
+    return _results(client.get(f"{_RESERVATIONS}resources/", params={"workspace": ws}).json())
+
+
+def _resolve_resource(ws: int, value: int | str) -> int:
+    items = _resources(ws)
+    if not isinstance(value, bool) and (isinstance(value, int) or str(value).strip().isdigit()):
+        if any(r.get("id") == int(value) for r in items):
+            return int(value)
+    else:
+        v = str(value).strip().lower()
+        hits = [r for r in items if str(r.get("name", "")).strip().lower() == v]
+        if len(hits) == 1:
+            return hits[0]["id"]
+    listing = ", ".join(f"{r.get('name')}(id={r.get('id')})" for r in items if r.get("is_active", True))
+    raise ValueError(f"리소스 '{value}'을(를) 찾을 수 없습니다. 예약 가능한 리소스: {listing or '(없음)'}")
+
+
+def _reservation_summary(r: dict) -> dict:
+    return _drop_empty({
+        "id": r.get("id"),
+        "resource": r.get("resource_name"),
+        "title": r.get("title"),
+        "start": (r.get("start_at") or "")[:16].replace("T", " "),
+        "end": (r.get("end_at") or "")[:16].replace("T", " "),
+        "quantity": r.get("quantity") if r.get("resource_type") == "equipment" else None,
+        "attendees": _names(r.get("attendees_detail")),
+        "creator": (r.get("creator_detail") or {}).get("full_name"),
+        "recurrence": _RECURRENCES.get(r.get("recurrence"), r.get("recurrence")),
+        "series_until": r.get("series_until"),
+        "memo": r.get("memo"),
+    })
+
+
+@mcp.tool
+async def list_resources(ctx: Context) -> dict:
+    """예약할 수 있는 리소스(회의실 등 공간·장비) 목록 — 현재 워크스페이스."""
+    ws = await _workspace_id(ctx)
+    return {"resources": [
+        _drop_empty({
+            "id": r.get("id"),
+            "name": r.get("name"),
+            "type": _RESOURCE_TYPES.get(r.get("type"), r.get("type")),
+            "group": r.get("group"),
+            "capacity": r.get("capacity"),
+            "quantity": r.get("quantity") if r.get("type") == "equipment" else None,
+        })
+        for r in _resources(ws) if r.get("is_active", True)
+    ]}
+
+
+@mcp.tool
+async def list_reservations(
+    ctx: Context,
+    start: str,
+    end: str | None = None,
+    resource: int | str | None = None,
+    mine: bool = False,
+) -> dict:
+    """리소스 예약 목록을 기간으로 조회한다(YYYY-MM-DD, end 생략 시 하루).
+
+    resource: 리소스 id 또는 이름(list_resources). mine=True: 내가 예약했거나 참석자인 것만.
+    """
+    ws = await _workspace_id(ctx)
+    end = end or start
+    if _parse_date(start, "start") > _parse_date(end, "end"):
+        raise ValueError(f"start({start})는 end({end})보다 늦을 수 없습니다.")
+    params: dict[str, str | int] = {"workspace": ws, "start": start, "end": end}
+    if resource is not None:
+        params["resource"] = _resolve_resource(ws, resource)
+    if mine:
+        params["mine"] = "true"
+    try:
+        items = _results(client.get(_RESERVATIONS, params=params).json())
+    except httpx.HTTPStatusError as e:
+        raise _reservation_error(e) from e
+    items.sort(key=lambda r: r.get("start_at") or "")
+    return {"count": len(items), "reservations": [_reservation_summary(r) for r in items]}
+
+
+def _resolve_recurrence(value: str | None) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    v = str(value).strip().lower()
+    for code, label in _RECURRENCES.items():
+        if v in (code, label):
+            return code
+    raise ValueError(
+        f"반복 '{value}'은(는) 지원하지 않습니다. 가능한 값: "
+        + ", ".join(f"{c}({l})" for c, l in _RECURRENCES.items())
+    )
+
+
+@mcp.tool
+async def create_reservation(
+    ctx: Context,
+    resource: int | str,
+    start: str,
+    end: str,
+    title: str | None = None,
+    attendees: list[int | str] | None = None,
+    quantity: int | None = None,
+    memo: str | None = None,
+    recurrence: str | None = None,
+    until: str | None = None,
+    count: int | None = None,
+) -> dict:
+    """리소스(회의실·장비)를 예약한다(현재 워크스페이스).
+
+    - resource: 리소스 id 또는 이름(list_resources). start/end: 'YYYY-MM-DD HH:MM'(서울 시각).
+    - 지난 시각(지금 30분 칸 이전)·오늘부터 12주 이후는 예약할 수 없다. 겹치면 겹치는 예약을 알려준다.
+    - attendees: 참석자 — 워크스페이스 멤버 user id·이름·'나'(초대 알림이 간다).
+    - quantity: 장비 수량(공간은 무시). recurrence: 매일/매주/2주마다/매월 — until(YYYY-MM-DD)이나
+      count(횟수)로 끝을 정하고, 둘 다 없으면 12주까지. 여러 날에 걸친 예약은 반복할 수 없다.
+    반복 예약은 회차마다 한 건씩 만들어져 created에 모두 나온다.
+    """
+    ws = await _workspace_id(ctx)
+    s_at, e_at = _parse_dt(start, "start"), _parse_dt(end, "end")
+    if e_at <= s_at:
+        raise ValueError("종료 시각은 시작 시각보다 늦어야 합니다.")
+    rec = _resolve_recurrence(recurrence)
+    if (until or count) and not rec:
+        raise ValueError("until·count는 recurrence(반복)와 함께만 쓸 수 있습니다.")
+    if until:
+        _parse_date(until, "until")
+    payload = _drop_empty({
+        "workspace": ws,
+        "resource": _resolve_resource(ws, resource),
+        "start_at": s_at,
+        "end_at": e_at,
+        "title": title,
+        "attendees": _resolve_ws_users(ws, attendees, "참석자"),
+        "quantity": quantity,
+        "memo": memo,
+        "recurrence": rec,
+        "until": until,
+        "count": count,
+    })
+    try:
+        created = _results(client.request("POST", _RESERVATIONS, json=payload).json())
+    except httpx.HTTPStatusError as e:
+        raise _reservation_error(e) from e
+    return {"count": len(created), "created": [_reservation_summary(r) for r in created]}
+
+
+_SCOPES = {"one": "이 예약만", "series": "이후 반복 전체"}
+
+
+def _resolve_scope(value: str | None) -> str:
+    v = str(value or "one").strip().lower()
+    for code, label in _SCOPES.items():
+        if v in (code, label):
+            return code
+    raise ValueError("scope는 one(이 예약만) 또는 series(이 회차부터 이후 반복 전체)입니다.")
+
+
+@mcp.tool
+async def update_reservation(
+    ctx: Context,
+    reservation_id: int,
+    start: str | None = None,
+    end: str | None = None,
+    title: str | None = None,
+    attendees: list[int | str] | None = None,
+    quantity: int | None = None,
+    memo: str | None = None,
+    resource: int | str | None = None,
+    scope: str = "one",
+) -> dict:
+    """예약을 부분 수정한다. reservation_id는 list_reservations/get_calendar의 id.
+
+    start/end: 'YYYY-MM-DD HH:MM'. attendees=[]면 참석자 전체 해제. resource로 다른 리소스로 옮길 수 있다.
+    반복 예약은 scope=one(이 예약만 — 반복에서 떨어져 나온다)/series(이 회차부터 이후 전체, 시각 변경은
+    같은 간격으로 옮겨진다). 이미 끝난 예약은 바꿀 수 없다.
+    """
+    ws = await _workspace_id(ctx)
+    payload = {k: v for k, v in {
+        "start_at": _parse_dt(start, "start") if start else None,
+        "end_at": _parse_dt(end, "end") if end else None,
+        "title": title,
+        "attendees": _resolve_ws_users(ws, attendees, "참석자"),
+        "quantity": quantity,
+        "memo": memo,
+        "resource": _resolve_resource(ws, resource) if resource is not None else None,
+    }.items() if v is not None}
+    if not payload:
+        raise ValueError("수정할 값을 하나 이상 전달하세요.")
+    try:
+        r = client.request(
+            "PATCH", f"{_RESERVATIONS}{reservation_id}/",
+            params={"scope": _resolve_scope(scope)}, json=payload,
+        ).json()
+    except httpx.HTTPStatusError as e:
+        raise _reservation_error(e) from e
+    return _reservation_summary(r)
+
+
+@mcp.tool
+def cancel_reservation(reservation_id: int, scope: str = "one", confirm: bool = False) -> dict:
+    """예약을 취소한다. scope=one(이 예약만)/series(이 회차부터 이후 반복 전체).
+
+    confirm=False(기본)면 대상만 미리 보여주고, confirm=True로 다시 호출해야 취소한다. 끝난 예약은 취소 불가.
+    """
+    sc = _resolve_scope(scope)
+    try:
+        r = client.get(f"{_RESERVATIONS}{reservation_id}/").json()
+        if not confirm:
+            what = "이후 반복 전체" if sc == "series" and r.get("series") else "이 예약"
+            return {"confirm_required": True,
+                    "message": f"{what}을(를) 취소합니다. confirm=true로 다시 호출하세요.",
+                    "reservation": _reservation_summary(r)}
+        client.request("DELETE", f"{_RESERVATIONS}{reservation_id}/", params={"scope": sc})
+    except httpx.HTTPStatusError as e:
+        raise _reservation_error(e) from e
+    return {"cancelled": True, "scope": _SCOPES[sc], "reservation": _reservation_summary(r)}
+
+
+# --- 프로젝트 이동 (B6) --------------------------------------------------------------
+_PARENT_ACTIONS = {"keep_together": "상위 트리째 함께 이동", "detach": "상위에서 떼고 단독 이동"}
+
+
+def _move_effects(task: dict, target: dict) -> list[str]:
+    """이동 시 서버가 바꾸는 값(tasks/views.py 이동 엔진)을 미리 알린다(네트워크 없음)."""
+    effects = ["태스크 번호가 대상 프로젝트 기준으로 새로 매겨집니다."]
+    if task.get("tag_list"):
+        effects.append("태그가 모두 제거됩니다(태그는 프로젝트마다 따로): "
+                       + ", ".join(g.get("name", "") for g in task["tag_list"]))
+    statuses = {s.get("name") for s in target.get("task_statuses", [])}
+    if statuses and task.get("status") not in statuses:
+        effects.append(f"상태 '{task.get('status')}'가 대상 프로젝트에 없어 기본 상태로 바뀝니다.")
+    for kind, field in (("task_priorities", "priority"), ("task_types", "task_type")):
+        names = {x.get("name") for x in target.get(kind, [])}
+        if names and task.get(field) not in names:
+            effects.append(f"{field} '{task.get(field)}'가 대상 프로젝트에 없어 기본값으로 바뀝니다.")
+    members = {m.get("user") for m in target.get("members", [])}
+    if task.get("assignee") and task["assignee"] not in members:
+        effects.append(f"담당자({task.get('assignee_name')})가 대상 프로젝트 멤버가 아니라 비워집니다.")
+    return effects
+
+
+@mcp.tool
+async def move_task_project(
+    ctx: Context,
+    task: int | str,
+    project: int,
+    include_subtasks: bool = True,
+    parent_action: str | None = None,
+    confirm: bool = False,
+) -> dict:
+    """태스크를 다른 프로젝트로 옮긴다(같은 워크스페이스 안). WBS 프로젝트는 출발·도착 모두 불가.
+
+    - task: 태스크 id·'#번호'·제목. project: 대상 프로젝트 id(list_projects).
+    - include_subtasks: 하위 태스크도 함께 옮길지(기본 True).
+    - parent_action: 상위가 있는 태스크면 필수 — keep_together(상위 트리째 함께 이동)/detach(상위에서 떼고 단독).
+    - **확인 게이트**: confirm=False(기본)면 함께 옮겨지는 수와 바뀌는 값(번호 재발급·태그 제거·
+      대상에 없는 상태값→기본값·비멤버 담당자 해제)을 미리 보여준다. confirm=True로 다시 호출해야 옮긴다.
+    """
+    tid = await _resolve_task(ctx, task)
+    t = client.get(f"{_TASKS}{tid}/").json()
+    target = _project(project)
+    if target.get("preset") == "wbs" or t.get("project_preset") == "wbs":
+        raise ValueError("WBS 프로젝트는 태스크를 옮겨 오거나 내보낼 수 없습니다.")
+    if project == t.get("project"):
+        raise ValueError("이미 그 프로젝트에 있는 태스크입니다.")
+    action = None
+    if parent_action is not None:
+        v = str(parent_action).strip().lower()
+        action = next((c for c, l in _PARENT_ACTIONS.items() if v in (c, l)), None)
+        if action is None:
+            raise ValueError("parent_action은 keep_together(상위 트리째 함께) 또는 detach(상위에서 떼고 단독)입니다.")
+    preview = client.get(f"{_TASKS}{tid}/move_preview/").json()
+    has_parent = t.get("parent") is not None
+    moving = (preview.get("keep_together_count", 0) if action == "keep_together"
+              else preview.get("descendant_count", 0) if include_subtasks else 0)
+    info = {
+        "task": _brief(t),
+        "from_project": t.get("project_name"),
+        "to_project": target.get("name"),
+        "also_moving_count": moving,
+        "effects": _move_effects(t, target),
+    }
+    if has_parent and action is None:
+        return {**info, "parent_action_required": True,
+                "message": "상위 태스크가 있어 처리 방식을 골라야 합니다: keep_together(상위 트리째 함께 이동, "
+                           f"{preview.get('keep_together_count', 0)}건 함께) / detach(상위에서 떼고 단독 이동)."}
+    if not confirm:
+        return {**info, "confirm_required": True,
+                "message": f"#{t.get('number')} '{t.get('title')}'을(를) '{target.get('name')}'(으)로 옮깁니다. "
+                           "confirm=true로 다시 호출하세요."}
+    body: dict = {"project": project, "include_subtasks": include_subtasks}
+    if action:
+        body["parent_action"] = action
+    try:
+        moved = client.request("POST", f"{_TASKS}{tid}/move_project/", json=body).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return {**info, "moved": True, "new_number": moved.get("number"), "url": _task_url(moved["id"])}
+
+
+# --- 일괄 변경 (B7) ------------------------------------------------------------------
+_BULK_CLEARABLE = {"assignee", "customer", "planned_start_date", "planned_end_date",
+                   "actual_start_date", "actual_end_date"}
+
+
+@mcp.tool
+async def bulk_update_tasks(
+    ctx: Context,
+    tasks: list[int | str],
+    status: str | None = None,
+    priority: str | None = None,
+    task_type: str | None = None,
+    assignee: int | str | None = None,
+    customer: int | str | None = None,
+    progress: int | None = None,
+    planned_start_date: str | None = None,
+    planned_end_date: str | None = None,
+    actual_start_date: str | None = None,
+    actual_end_date: str | None = None,
+    is_report_task: bool | None = None,
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+    clear_fields: list[str] | None = None,
+) -> dict:
+    """여러 태스크(최대 100건)에 같은 값을 한 번에 적용한다(웹 목록의 '일괄 변경').
+
+    - tasks: 태스크 id·'#번호'·제목 목록. 값은 **현재 레포 프로젝트** 기준으로 해석한다(상태 등 한글 라벨 가능).
+    - 바꿀 수 있는 값: status/priority/task_type/assignee(멤버 이름 가능)/customer(id·이름)/progress/
+      예상·실제 날짜/is_report_task(주간 회의 공유).
+    - add_tags / remove_tags: 태그 **이름**으로 추가·빼기(둘 중 하나만). 프로젝트에 없는 태그를 더하려는 태스크는 실패.
+    - clear_fields: 비우기 — assignee, customer, planned_start_date, planned_end_date, actual_start_date, actual_end_date.
+    - 태스크마다 따로 적용된다 — 권한 없음·유효하지 않은 값 등은 failed(사유)로, 나머지는 updated로 돌려준다.
+    상위 지정은 link_subtasks, 상위 해제는 unlink_subtasks를 쓴다.
+    """
+    ids = await _resolve_task_ids(ctx, tasks, "변경할 태스크")
+    _validate_dates(planned_start_date, planned_end_date, actual_start_date, actual_end_date)
+    if add_tags and remove_tags:
+        raise ValueError("add_tags와 remove_tags는 한 번에 하나만 쓸 수 있습니다.")
+    fields: dict = {}
+    if status is not None or priority is not None or task_type is not None or assignee is not None:
+        pid = (await _resolve_context(ctx)).get("project_id")
+        if pid is None:
+            pid = client.get(f"{_TASKS}{ids[0]}/").json().get("project")
+        pj = _project(pid)
+        if status is not None:
+            fields["status"] = _resolve_enum_value(pj, "status", status)
+        if priority is not None:
+            fields["priority"] = _resolve_enum_value(pj, "priority", priority)
+        if task_type is not None:
+            fields["task_type"] = _resolve_enum_value(pj, "task_type", task_type)
+        if assignee is not None:
+            fields["assignee"], _ = _resolve_members(pid, assignee, None, project=pj)
+    if customer is not None:
+        fields["customer"] = _resolve_customer(await _workspace_id(ctx), customer)
+    for k, v in (("progress", progress), ("planned_start_date", planned_start_date),
+                 ("planned_end_date", planned_end_date), ("actual_start_date", actual_start_date),
+                 ("actual_end_date", actual_end_date), ("is_report_task", is_report_task),
+                 ("add_tags", add_tags or None), ("remove_tags", remove_tags or None)):
+        if v is not None:
+            fields[k] = v
+    for f in clear_fields or []:
+        if f not in _BULK_CLEARABLE:
+            raise ValueError(f"비울 수 없는 필드: {f}. 가능한 필드: {', '.join(sorted(_BULK_CLEARABLE))}")
+        if f in fields:
+            raise ValueError(f"같은 필드에 값과 비우기를 함께 줄 수 없습니다: {f}")
+        fields[f] = None
+    if not fields:
+        raise ValueError("바꿀 값을 하나 이상 전달하세요.")
+    try:
+        data = client.request("POST", f"{_TASKS}bulk_update/", json={"task_ids": ids, "fields": fields}).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return {
+        "updated": [_brief(t) for t in data.get("updated", [])],
+        "failed": data.get("failed", []),
+    }
+
+
+# --- 고객 접수 (B13/C9) ---------------------------------------------------------------
+_ISSUE_OPTION_PATHS = {"issue_type": "issue-types", "status": "issue-statuses", "priority": "issue-priorities"}
+_ISSUE_OPTION_LABELS = {"issue_type": "유형", "status": "상태", "priority": "우선순위"}
+_ISSUE_OPTIONS_CACHE: dict[int, tuple[float, dict]] = {}
+_ISSUES = "/api/customers/issues/"
+
+
+def _issue_options(ws: int) -> dict[str, list[dict]]:
+    """워크스페이스의 고객 접수 유형·상태·우선순위 설정(#744) — 코드·이름."""
+    hit = _ISSUE_OPTIONS_CACHE.get(ws)
+    if hit and time.monotonic() - hit[0] < _PROJECT_TTL:
+        return hit[1]
+    opts = {
+        kind: _results(client.get(f"/api/customers/{path}/", params={"workspace": ws}).json())
+        for kind, path in _ISSUE_OPTION_PATHS.items()
+    }
+    _ISSUE_OPTIONS_CACHE[ws] = (time.monotonic(), opts)
+    return opts
+
+
+def _resolve_issue_option(opts: dict, kind: str, value: str, assign: bool = True) -> str:
+    """코드 또는 이름(대소문자 무시)을 코드로. assign=True면 사용 중인(활성) 항목만."""
+    items = [o for o in opts.get(kind, []) if not assign or o.get("is_active", True)]
+    v = str(value).strip().lower()
+    for o in items:
+        if v in (str(o.get("code", "")).lower(), str(o.get("name", "")).strip().lower(),
+                 str(o.get("name_en", "")).strip().lower()):
+            return o["code"]
+    valid = ", ".join(f"{o.get('name')}({o.get('code')})" for o in items)
+    raise ValueError(f"고객 접수 {_ISSUE_OPTION_LABELS[kind]} '{value}'은(는) 없습니다. 가능한 값: {valid}")
+
+
+def _issue_label(opts: dict, kind: str, code: str | None) -> str | None:
+    return next((o.get("name") for o in opts.get(kind, []) if o.get("code") == code), code)
+
+
+def _issue_summary(i: dict, opts: dict) -> dict:
+    return _drop_empty({
+        "id": i.get("id"),
+        "number": i.get("number"),
+        "title": i.get("title"),
+        "customer": i.get("customer"),
+        "customer_name": i.get("customer_name"),
+        "issue_type": _issue_label(opts, "issue_type", i.get("issue_type")),
+        "status": _issue_label(opts, "status", i.get("status")),
+        "priority": _issue_label(opts, "priority", i.get("priority")),
+        "assignee_name": i.get("assignee_name"),
+        "progress": i.get("progress"),
+        "planned_end_date": i.get("planned_end_date"),
+        "converted_task": (
+            {"number": i.get("converted_task_number"), "title": i.get("converted_task_title"),
+             "project_name": i.get("converted_task_project_name"), "url": _task_url(i["converted_task"])}
+            if i.get("converted_task") else None
+        ),
+        "url": _issue_url(i.get("customer"), i.get("id")),
+    })
+
+
+def _pick_issue(hits: list[dict], number: int) -> dict:
+    """'#번호' 검색 결과에서 하나를 고른다. 접수 번호는 **고객사마다 따로** 매겨져 여러 고객사에 같은
+    번호가 있을 수 있다 — 하나가 아니면 고르지 않고 고객사 지정을 요구한다(엉뚱한 접수를 고치지 않게)."""
+    hits = [i for i in hits if i.get("number") == number]
+    if not hits:
+        raise ValueError(f"고객 접수 #{number}을(를) 찾을 수 없습니다(숨김·삭제됐을 수 있음).")
+    if len(hits) > 1:
+        listing = ", ".join(f"{i.get('customer_name')}(customer={i.get('customer')})" for i in hits[:10])
+        raise ValueError(
+            f"#{number} 접수가 고객사 {len(hits)}곳에 있습니다(번호는 고객사마다 따로 매겨짐): {listing} "
+            f"— customer로 고객사를 함께 지정하세요."
+        )
+    return hits[0]
+
+
+async def _find_issue(ctx: Context, issue: int | str, customer: int | str | None) -> tuple[int, int]:
+    """'#번호'(+고객사) 또는 내부 id(+고객사)로 (customer_id, issue_id)."""
+    ws = await _workspace_id(ctx)
+    number = _parse_task_number(issue)
+    if number is not None:
+        params: dict[str, str | int] = {"workspace": ws, "search": f"#{number}"}
+        if customer is not None:
+            params["customer"] = _resolve_customer(ws, customer)
+        hit = _pick_issue(_results(client.get(_ISSUES, params=params).json()), number)
+        return hit["customer"], hit["id"]
+    if not isinstance(issue, bool) and (isinstance(issue, int) or str(issue).strip().isdigit()):
+        if customer is None:
+            raise ValueError("고객 접수는 '#번호'로 지정하세요(내부 id로 지정하려면 customer도 함께).")
+        return _resolve_customer(ws, customer), int(issue)
+    raise ValueError("고객 접수는 '#번호'(예: '#12') 또는 내부 id로 지정하세요.")
+
+
+@mcp.tool
+async def list_customer_issues(
+    ctx: Context,
+    query: str | None = None,
+    status: list[str] | None = None,
+    customer: int | str | None = None,
+    mine: bool = False,
+    overdue: bool = False,
+    limit: int = 20,
+) -> dict:
+    """고객 접수(웹 '고객 접수' 화면)를 현재 워크스페이스 전체에서 조회한다(최신 접수순, 숨김·삭제 제외).
+
+    - query: 제목·내용·댓글 검색어. '#12'면 번호 12인 접수만 — 번호는 **고객사마다 따로** 매겨지므로
+      여러 고객사의 #12가 함께 나올 수 있다(customer로 좁힌다).
+    - status: 상태 이름 또는 코드 목록(워크스페이스 설정 — 예: 접수/진행/완료). customer: 고객사 id·이름.
+    - mine=True: 내가 담당이거나 작성한 것. overdue=True: 예상 종료일이 지난 미완료.
+    - 각 항목: 번호·제목·고객사·유형·상태·우선순위·담당자·진행률·전환된 태스크(있으면).
+    볼 수 없는 고객사의 접수는 서버가 뺀다. 접근 권한이 없으면 안내한다.
+    """
+    ws = await _workspace_id(ctx)
+    opts = _issue_options(ws)
+    params: dict[str, str | int] = {"workspace": ws}
+    if query:
+        params["search"] = query
+    if status:
+        params["status"] = ",".join(_resolve_issue_option(opts, "status", s, assign=False) for s in status)
+    if customer is not None:
+        params["customer"] = _resolve_customer(ws, customer)
+    if mine:
+        params["mine"] = "true"
+    if overdue:
+        params["overdue"] = "true"
+    limit = max(1, min(limit, 100))
+    try:
+        items = _get_all_pages(_ISSUES, params, max_items=limit)
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return {"count": len(items), "issues": [_issue_summary(i, opts) for i in items]}
+
+
+@mcp.tool
+async def get_customer_issue(ctx: Context, issue: int | str, customer: int | str | None = None) -> dict:
+    """고객 접수 상세(본문 포함)를 조회한다.
+
+    issue는 '#번호' 또는 내부 id. 접수 번호는 **고객사마다 따로** 매겨진다 — 같은 번호가 여러 고객사에 있으면
+    후보를 알려주고 멈추므로 customer(고객사 id·이름)를 함께 준다. 내부 id로 지정할 때도 customer가 필요하다.
+    """
+    ws = await _workspace_id(ctx)
+    cid, iid = await _find_issue(ctx, issue, customer)
+    try:
+        i = client.get(f"{_CUSTOMERS}{cid}/issues/{iid}/").json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    out = _issue_summary(i, _issue_options(ws))
+    out.update(_drop_empty({
+        "description": i.get("description"),
+        "creator_name": i.get("creator_name"),
+        "planned_start_date": i.get("planned_start_date"),
+        "actual_start_date": i.get("actual_start_date"),
+        "actual_end_date": i.get("actual_end_date"),
+        "created_at": i.get("created_at"),
+        "updated_at": i.get("updated_at"),
+    }))
+    return out
+
+
+@mcp.tool
+async def create_customer_issue(
+    ctx: Context,
+    customer: int | str,
+    title: str,
+    description: str | None = None,
+    issue_type: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    assignee: int | str | None = None,
+    planned_start_date: str | None = None,
+    planned_end_date: str | None = None,
+) -> dict:
+    """고객 접수를 등록한다(고객사 아래). customer: 고객사 id 또는 이름(현재 워크스페이스).
+
+    - issue_type/status/priority: 워크스페이스 고객 접수 설정의 이름 또는 코드 — 생략하면 서버 기본값.
+      없는 값은 가능한 목록과 함께 막는다.
+    - description: 평문이면 리치텍스트(HTML)로 변환해 저장한다(태스크 본문과 같은 규칙).
+    - assignee: 워크스페이스 멤버 user id·이름·'나'.
+    태스크로 넘기려면 convert_issue_to_task.
+    """
+    ws = await _workspace_id(ctx)
+    _validate_dates(planned_start_date, planned_end_date)
+    opts = _issue_options(ws)
+    cid = _resolve_customer(ws, customer)
+    payload = _drop_empty({
+        "title": title,
+        "description": normalize_description(description) if description else None,
+        "issue_type": _resolve_issue_option(opts, "issue_type", issue_type) if issue_type else None,
+        "status": _resolve_issue_option(opts, "status", status) if status else None,
+        "priority": _resolve_issue_option(opts, "priority", priority) if priority else None,
+        "assignee": _match_user(_workspace_members(ws), assignee, "담당자") if assignee is not None else None,
+        "planned_start_date": planned_start_date,
+        "planned_end_date": planned_end_date,
+    })
+    try:
+        i = client.request("POST", f"{_CUSTOMERS}{cid}/issues/", json=payload).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    return _issue_summary(i, opts)
+
+
+@mcp.tool
+async def convert_issue_to_task(
+    ctx: Context,
+    issue: int | str,
+    project: int | None = None,
+    task: int | str | None = None,
+    task_type: str | None = None,
+    replace: bool = False,
+    customer: int | str | None = None,
+) -> dict:
+    """고객 접수를 태스크로 넘긴다 — 새 태스크 만들기(project) 또는 기존 태스크에 연결(task) 중 하나.
+
+    - issue: '#번호' 또는 내부 id. 번호는 고객사마다 따로라 여러 고객사에 같은 번호가 있으면 멈추고
+      customer(고객사 id·이름)를 요구한다(내부 id일 때도 customer 필요).
+    - project: 새 태스크를 만들 프로젝트 id. 제목·본문·우선순위·담당자·날짜·진행률이 접수에서 복사되고
+      고객사가 지정된다. task_type은 그 프로젝트 유형 이름(생략 시 '기타').
+      ⚠️ 서버가 상태를 'open'으로 고정해 만들므로 WBS 프로젝트로는 막는다.
+    - task: 연결할 기존 태스크(id·'#번호'·제목 — #번호·제목은 현재 프로젝트 기준).
+    - replace=True: 이미 연결된 태스크를 바꾼다(기존 태스크는 활동 이력이 없으면 휴지통, 있으면 연결만 끊음).
+    """
+    if (project is None) == (task is None):
+        raise ValueError("project(새 태스크)와 task(기존 태스크) 중 하나만 지정하세요.")
+    cid, iid = await _find_issue(ctx, issue, customer)
+    body: dict = {"replace": replace}
+    if project is not None:
+        pj = _project(project)
+        if pj.get("preset") == "wbs":
+            raise ValueError("WBS 프로젝트로는 고객 접수를 태스크로 넘길 수 없습니다(서버가 상태를 'open'으로 만든다).")
+        body["project_id"] = project
+        body["task_type"] = _resolve_enum_value(pj, "task_type", task_type)
+    else:
+        body["task_id"] = await _resolve_task(ctx, task)
+    try:
+        i = client.request("POST", f"{_CUSTOMERS}{cid}/issues/{iid}/convert/", json=body).json()
+    except httpx.HTTPStatusError as e:
+        raise _server_error(e) from e
+    out = _issue_summary(i, _issue_options(await _workspace_id(ctx)))
+    if i.get("previous_task_deleted") is not None:
+        out["previous_task_deleted"] = i["previous_task_deleted"]
+    return out
+
+
 @mcp.prompt
 def gdc_login() -> str:
     """GDC 브라우저 핸드오프 인증/재인증 (워크스페이스·프로젝트 선택)."""

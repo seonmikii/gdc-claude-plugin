@@ -151,6 +151,15 @@ Claude Desktop은 **플러그인/마켓플레이스/슬래시 커맨드/훅을 �
 | `list_trashed_tasks` | 현재 프로젝트 휴지통(삭제된 태스크) 목록 — 복구 대상 식별 |
 | `list_my_notifications` | 내 알림 목록(멘션·댓글·담당자 변경 등) + 미읽음 수 — 조회 전용, 전 워크스페이스 혼재 |
 | `list_my_mentions` | 나와 관련된 댓글 멘션 목록(`mentioned`/`authored`/`both`, 기간·검색) — 현재 컨텍스트 스코프, 조회 전용 |
+| `get_weekly_sync` | 주간 업무(저번주/이번주/리스크/날짜 미정) — **워크스페이스 관리자 이상 전용**. 기본은 현재 프로젝트만, `all_projects`·`my_projects_only`·담당자 필터 |
+| `get_calendar` | 통합 캘린더(태스크·고객 접수·일정·예약)를 기간으로 조회 — 여러 날 항목은 한 줄로 접어 표시, 최대 92일 |
+| `create_schedule` / `update_schedule` / `delete_schedule` | 캘린더 일정(외근·휴가·외부 일정·일반) 등록·수정·삭제 — 참석자는 워크스페이스 멤버 이름, 삭제는 `confirm` 게이트 |
+| `list_resources` / `list_reservations` | 예약 가능한 리소스(공간·장비)와 예약 목록 |
+| `create_reservation` / `update_reservation` / `cancel_reservation` | 리소스 예약·수정·취소 — 반복(매일·매주·2주마다·매월), 겹침은 겹치는 예약을 안내, 반복 건은 `scope`(이 예약만/이후 전체), 취소는 `confirm` 게이트 |
+| `move_task_project` | 태스크를 다른 프로젝트로 이동 — 미리보기에 함께 옮겨지는 수와 바뀌는 값(번호 재발급·태그 제거 등) 표시, `confirm` 게이트, WBS 불가 |
+| `bulk_update_tasks` | 여러 태스크(최대 100)에 상태·우선순위·담당자·날짜·주간 회의 공유·태그 추가/빼기를 한 번에 — 태스크별 성공/실패 |
+| `list_customer_issues` / `get_customer_issue` | 고객 접수 조회(워크스페이스 전체, 검색·상태·고객사·내 것·지연 필터)·상세. **접수 번호는 고객사마다 따로**라 `#번호`가 겹치면 `customer`로 지정 |
+| `create_customer_issue` / `convert_issue_to_task` | 고객 접수 등록(유형·상태·우선순위는 워크스페이스 설정 이름), 접수를 새 태스크로 만들거나 기존 태스크에 연결 |
 | `submit_suggestion` | GDC·플러그인 건의사항 제출(버그/기능 요청/개선 제안/기타) — 워크스페이스·프로젝트 무관, 컨텍스트 불필요 |
 | `list_my_suggestions` | 내가 제출한 건의사항 목록(상태·분류 필터) — 답변 여부(`has_reply`)까지, 본문·답변은 상세에서 |
 | `get_suggestion` | 건의사항 상세 — 본문 + 관리자 답변 + 답변자·답변 시각 |
